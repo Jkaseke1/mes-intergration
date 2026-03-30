@@ -38,152 +38,106 @@ async function safeWrite(description, sqlFn) {
   }
 }
 
-async function handleGoodsReceipt(syncEvent) {
-  console.log('\n  → Event 1: Goods Receipt (Auto)');
+async function handleGoodsIssue(syncEvent) {
+  console.log('\n  → Event 2: Goods Issue (Auto)');
 
-  const grnId = syncEvent.reference_id;
-  console.log(`  GRN ID: ${grnId}`);
+  const materialId = syncEvent.reference_id;
 
-  const { data: grn, error: grnError } = await supabase
-    .from('goods_received_notes')
-    .select('id, grn_number, received_date, status, supplier_id')
-    .eq('id', grnId)
+  const { data: material, error } = await supabase
+    .from('production_order_materials')
+    .select('id, actual_qty, unit_cost, issued_at, production_order_id, raw_material_id')
+    .eq('id', materialId)
     .single();
 
-  if (grnError || !grn) {
-    throw new Error(`GRN not found: ${grnId} — ${grnError?.message}`);
+  if (error || !material) {
+    throw new Error(`Material not found: ${materialId}`);
   }
 
-  const { data: supplier } = await supabase
-    .from('suppliers')
+  const { data: order } = await supabase
+    .from('production_orders')
+    .select('id, batch_number')
+    .eq('id', material.production_order_id)
+    .single();
+
+  const { data: rm } = await supabase
+    .from('raw_materials')
     .select('id, name, sage_code')
-    .eq('id', grn.supplier_id)
+    .eq('id', material.raw_material_id)
     .single();
 
-  console.log(`  GRN: ${grn.grn_number} — ${supplier?.name}`);
+  const sageCode    = rm?.sage_code;
+  const batchNumber = order?.batch_number;
+  const actualQty   = Number(material.actual_qty || 0);
 
-  const { data: items, error: itemsError } = await supabase
-    .from('grn_items')
-    .select('id, received_qty, unit_cost, raw_material_id')
-    .eq('grn_id', grnId);
+  console.log(`  Batch: ${batchNumber}`);
+  console.log(`  Material: ${sageCode} — ${actualQty}kg`);
 
-  console.log(`  Items debug: count=${items?.length} error=${itemsError?.message}`);
-
-  if (itemsError) throw new Error(`Items query error: ${itemsError.message}`);
-  if (!items || items.length === 0) throw new Error(`No items found for GRN: ${grn.grn_number}`);
-
-  console.log(`  Items: ${items.length} line(s)`);
-
-  for (const item of items) {
-    const { data: rm } = await supabase
-      .from('raw_materials')
-      .select('id, name, sage_code')
-      .eq('id', item.raw_material_id)
-      .single();
-    item.raw_materials = rm;
-    console.log(`  RM lookup: ${item.raw_material_id} → ${rm?.name} (${rm?.sage_code})`);
-  }
+  if (!sageCode) throw new Error(`No sage_code for material ${materialId}`);
+  if (actualQty <= 0) throw new Error(`Invalid quantity: ${actualQty}`);
 
   let pool;
   try {
     pool = await sql.connect(sageConfig);
 
-    for (const item of items) {
-      const sageCode = item.raw_materials?.sage_code;
-      const rmName   = item.raw_materials?.name;
+    const stockResult = await pool.request()
+      .input('Code', sql.VarChar, sageCode)
+      .query(`SELECT StockLink FROM StkItem WHERE Code = @Code AND ItemActive = 1`);
 
-      if (!sageCode) {
-        console.log(`  ⚠️  No sage_code for item — skipping`);
-        continue;
-      }
-
-      const stockResult = await pool.request()
-        .input('Code', sql.VarChar, sageCode)
-        .query(`SELECT StockLink, Description_1 FROM StkItem WHERE Code = @Code AND ItemActive = 1`);
-
-      if (stockResult.recordset.length === 0) {
-        console.log(`  ⚠️  ${sageCode} not found in Sage — skipping`);
-        continue;
-      }
-
-      const stockLink   = stockResult.recordset[0].StockLink;
-      const reference   = grn.grn_number.substring(0, 20);
-      const description = (rmName || sageCode).substring(0, 40);
-
-      console.log(`  Processing: ${sageCode} — ${item.received_qty}kg @ $${item.unit_cost}`);
-
-      await safeWrite(
-        `GRN ${grn.grn_number} — ${sageCode} +${item.received_qty}kg`,
-        async () => {
-          await pool.request()
-            .input('iInvJrBatchID', sql.Int,      2)
-            .input('iStockID',      sql.Int,      stockLink)
-            .input('iWarehouseID',  sql.Int,      18)
-            .input('dTrDate',       sql.DateTime, new Date(grn.received_date))
-            .input('iTrCodeID',     sql.Int,      31)
-            .input('iGLContraID',   sql.Int,      0)
-            .input('cReference',    sql.VarChar,  reference)
-            .input('cDescription',  sql.VarChar,  description)
-            .input('fQtyIn',        sql.Float,    Number(item.received_qty))
-            .input('fQtyOut',       sql.Float,    0)
-            .input('fNewCost',      sql.Float,    Number(item.unit_cost || 0))
-            .input('bIsLotItem',    sql.Bit,      0)
-            .input('bIsSerialItem', sql.Bit,      0)
-            .query(`
-              INSERT INTO _etblInvJrBatchLines (
-                iInvJrBatchID, iStockID, iWarehouseID,
-                dTrDate, iTrCodeID, iGLContraID,
-                cReference, cDescription,
-                fQtyIn, fQtyOut, fNewCost,
-                bIsLotItem, bIsSerialItem
-              ) VALUES (
-                @iInvJrBatchID, @iStockID, @iWarehouseID,
-                @dTrDate, @iTrCodeID, @iGLContraID,
-                @cReference, @cDescription,
-                @fQtyIn, @fQtyOut, @fNewCost,
-                @bIsLotItem, @bIsSerialItem
-              )
-            `);
-
-          const existing = await pool.request()
-            .input('StockID', sql.Int, stockLink)
-            .input('WhseID',  sql.Int, 18)
-            .query(`SELECT idStockQtys FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
-
-          if (existing.recordset.length > 0) {
-            await pool.request()
-              .input('StockID', sql.Int,   stockLink)
-              .input('WhseID',  sql.Int,   18)
-              .input('QtyIn',   sql.Float, Number(item.received_qty))
-              .query(`UPDATE _etblStockQtys SET QtyOnHand = QtyOnHand + @QtyIn WHERE StockID = @StockID AND WhseID = @WhseID`);
-          } else {
-            await pool.request()
-              .input('StockID', sql.Int,   stockLink)
-              .input('WhseID',  sql.Int,   18)
-              .input('QtyIn',   sql.Float, Number(item.received_qty))
-              .query(`INSERT INTO _etblStockQtys (StockID, WhseID, QtyOnHand) VALUES (@StockID, @WhseID, @QtyIn)`);
-          }
-        }
-      );
-
-      // ── Auto-update cost_per_unit in MES from GRN unit cost ──────────────
-      if (item.unit_cost && Number(item.unit_cost) > 0 && !DRY_RUN) {
-        const { error: costError } = await supabase
-          .from('raw_materials')
-          .update({ cost_per_unit: Number(item.unit_cost) })
-          .eq('sage_code', sageCode);
-
-        if (!costError) {
-          console.log(`  Cost updated: ${sageCode} = $${item.unit_cost}/kg`);
-        }
-      } else if (DRY_RUN && item.unit_cost > 0) {
-        console.log(`  [DRY RUN] Would update cost: ${sageCode} = $${item.unit_cost}/kg`);
-      }
-      // ── End cost update ───────────────────────────────────────────────────
+    if (stockResult.recordset.length === 0) {
+      throw new Error(`${sageCode} not found in Sage`);
     }
+
+    const stockLink   = stockResult.recordset[0].StockLink;
+    const reference   = `WO-${batchNumber}`.substring(0, 20);
+    const description = `Issue to ${batchNumber}`.substring(0, 40);
+
+    await safeWrite(
+      `Issue ${actualQty}kg of ${sageCode} for ${batchNumber}`,
+      async () => {
+        await pool.request()
+          .input('iInvJrBatchID', sql.Int,      2)
+          .input('iStockID',      sql.Int,      stockLink)
+          .input('iWarehouseID',  sql.Int,      18)
+          .input('dTrDate',       sql.DateTime, new Date())
+          .input('iTrCodeID',     sql.Int,      31)
+          .input('iGLContraID',   sql.Int,      0)
+          .input('cReference',    sql.VarChar,  reference)
+          .input('cDescription',  sql.VarChar,  description)
+          .input('fQtyIn',        sql.Float,    0)
+          .input('fQtyOut',       sql.Float,    actualQty)
+          .input('fNewCost',      sql.Float,    Number(material.unit_cost || 0))
+          .input('bIsLotItem',    sql.Bit,      0)
+          .input('bIsSerialItem', sql.Bit,      0)
+          .query(`
+            INSERT INTO _etblInvJrBatchLines (
+              iInvJrBatchID, iStockID, iWarehouseID,
+              dTrDate, iTrCodeID, iGLContraID,
+              cReference, cDescription,
+              fQtyIn, fQtyOut, fNewCost,
+              bIsLotItem, bIsSerialItem
+            ) VALUES (
+              @iInvJrBatchID, @iStockID, @iWarehouseID,
+              @dTrDate, @iTrCodeID, @iGLContraID,
+              @cReference, @cDescription,
+              @fQtyIn, @fQtyOut, @fNewCost,
+              @bIsLotItem, @bIsSerialItem
+            )
+          `);
+
+        await pool.request()
+          .input('StockID', sql.Int,   stockLink)
+          .input('WhseID',  sql.Int,   18)
+          .input('QtyOut',  sql.Float, actualQty)
+          .query(`
+            UPDATE _etblStockQtys 
+            SET QtyOnHand = QtyOnHand - @QtyOut 
+            WHERE StockID = @StockID AND WhseID = @WhseID
+          `);
+      }
+    );
   } finally {
     if (pool) await sql.close();
   }
 }
 
-module.exports = { handleGoodsReceipt };
+module.exports = { handleGoodsIssue };
