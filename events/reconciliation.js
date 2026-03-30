@@ -23,9 +23,6 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ─── Event 6: Nightly Reconciliation ─────────────────────────────────────────
-// Runs nightly — compares MES raw material quantities vs Sage quantities
-// Flags variances for Archfold and Joseph to review each morning
 async function runReconciliation() {
   console.log('\n─── Event 6: Nightly Reconciliation ─────────────────────');
   console.log(`Mode          : ${DRY_RUN ? 'DRY RUN' : 'LIVE'}`);
@@ -41,7 +38,7 @@ async function runReconciliation() {
   try {
     pool = await sql.connect(sageConfig);
 
-    // Step 1: Get all raw material quantities from Sage (warehouse 18 = RM)
+    // Step 1: Get all raw material quantities from Sage
     console.log('\nReading stock quantities from Sage (warehouse 18)...');
     const sageQty = await pool.request()
       .query(`
@@ -74,11 +71,9 @@ async function runReconciliation() {
     console.log('\nComparing quantities...\n');
 
     for (const sageItem of sageQty.recordset) {
-      // Find matching MES item by sage_code
       const mesItem = mesItems.find(m => m.sage_code === sageItem.sage_code);
 
       if (!mesItem) {
-        // In Sage but not in MES
         results.push({
           sage_code:   sageItem.sage_code,
           description: sageItem.description,
@@ -91,11 +86,11 @@ async function runReconciliation() {
         continue;
       }
 
-      const mesQty    = mesItem.current_stock ?? 0;
+      const mesQty     = mesItem.current_stock ?? 0;
       const sageQtyVal = sageItem.sage_qty ?? 0;
-      const variance  = mesQty - sageQtyVal;
+      const variance   = mesQty - sageQtyVal;
       const absVariance = Math.abs(variance);
-      const threshold = 0.5; // kg — ignore tiny floating point differences
+      const threshold  = 0.5;
 
       let status = 'OK';
       if (absVariance > threshold) {
@@ -131,36 +126,62 @@ async function runReconciliation() {
       }
     }
 
-    // Step 4b: Auto-update MES current_stock from Sage
+    // Step 4b: Auto-update MES current_stock AND cost_per_unit from Sage
     if (!DRY_RUN) {
       console.log('\nUpdating MES current_stock from Sage...');
-      let updated = 0;
+      let stockUpdated = 0;
+      let costUpdated  = 0;
+
       for (const sageItem of sageQty.recordset) {
         const mesItem = mesItems.find(m => m.sage_code === sageItem.sage_code);
         if (!mesItem) continue;
-        const { error: updateError } = await supabase
+
+        // Update current stock
+        const { error: stockErr } = await supabase
           .from('raw_materials')
-          .update({
-            current_stock: sageItem.sage_qty,
-            updated_at:    new Date().toISOString(),
-          })
+          .update({ current_stock: sageItem.sage_qty })
           .eq('sage_code', sageItem.sage_code);
-        if (!updateError) updated++;
+        if (!stockErr) stockUpdated++;
+
+        // ── Sync latest cost from Sage GRV ───────────────────────────────
+        const latestCost = await pool.request()
+          .input('Code', sql.VarChar, sageItem.sage_code)
+          .query(`
+            SELECT TOP 1
+                l.fUnitCost
+            FROM _btblInvoiceLines l
+            JOIN StkItem s ON s.StockLink = l.iStockCodeID
+            JOIN InvNum n ON n.AutoIndex = l.iInvoiceID
+            WHERE s.Code = @Code
+            AND n.DocType = 2
+            AND l.fUnitCost > 0
+            ORDER BY n.InvDate DESC
+          `);
+
+        if (latestCost.recordset.length > 0 && latestCost.recordset[0].fUnitCost > 0) {
+          const { error: costErr } = await supabase
+            .from('raw_materials')
+            .update({ cost_per_unit: latestCost.recordset[0].fUnitCost })
+            .eq('sage_code', sageItem.sage_code);
+          if (!costErr) costUpdated++;
+        }
+        // ── End cost sync ─────────────────────────────────────────────────
       }
-      console.log(`Updated current_stock for ${updated} raw materials from Sage`);
+
+      console.log(`Updated current_stock for ${stockUpdated} raw materials from Sage`);
+      console.log(`Updated cost_per_unit for ${costUpdated} raw materials from Sage`);
     }
 
     // Step 5: Print summary
+    const variantItems = results.filter(r =>
+      r.status === 'HIGH_VARIANCE' || r.status === 'LOW_VARIANCE'
+    );
+
     console.log('─── RECONCILIATION RESULTS ───────────────────────────────');
     console.log(`✅ Matched (within 0.5kg)  : ${matched}`);
     console.log(`⚠️  Variances found        : ${variances}`);
     console.log(`❓ Not in MES              : ${missing}`);
     console.log('──────────────────────────────────────────────────────────\n');
-
-    // Show variances
-    const variantItems = results.filter(r =>
-      r.status === 'HIGH_VARIANCE' || r.status === 'LOW_VARIANCE'
-    );
 
     if (variantItems.length > 0) {
       console.log('VARIANCES REQUIRING REVIEW:');
@@ -176,7 +197,6 @@ async function runReconciliation() {
       console.log('✅ No significant variances — MES and Sage are in sync');
     }
 
-    // Show items not in MES
     const notInMes = results.filter(r => r.status === 'NOT_IN_MES');
     if (notInMes.length > 0) {
       console.log(`\nITEMS IN SAGE WH18 BUT NOT IN MES (${notInMes.length}):`);
@@ -188,7 +208,7 @@ async function runReconciliation() {
       }
     }
 
-    // Step 6: Write results to Supabase sync_log
+    // Step 6: Write to sync_log
     if (!DRY_RUN) {
       const { error: logError } = await supabase
         .from('sync_log')
@@ -200,18 +220,16 @@ async function runReconciliation() {
         });
 
       if (logError) {
-        console.log('\n⚠️  Could not write to sync_log — table may not exist yet');
+        console.log('\n⚠️  Could not write to sync_log');
       } else {
         console.log('\n✅ Results logged to sync_log');
       }
 
-      // Write variance details to recon_raw_materials if variances exist
       if (variantItems.length > 0) {
         console.log('\nWriting variance details to recon_raw_materials...');
         for (const item of variantItems) {
           const mesItem = mesItems.find(m => m.sage_code === item.sage_code);
           if (!mesItem) continue;
-
           await supabase
             .from('recon_raw_materials')
             .upsert({

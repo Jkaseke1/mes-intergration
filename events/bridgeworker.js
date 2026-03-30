@@ -8,16 +8,15 @@ const supabase = createClient(
 );
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
-const POLL_INTERVAL_MS = 30000; // check every 30 seconds
+const POLL_INTERVAL_MS = 30000;
 
 // Import event handlers
-const { handleGoodsReceipt }    = require('./goodsReceiptAuto');
-const { handleGoodsIssue }      = require('./goodsIssueAuto');
-const { handleBatchComplete }   = require('./batchCompleteAuto');
-const { handleDispatch }        = require('./dispatchAuto');
+const { handleGoodsReceipt }  = require('./goodsReceiptAuto');
+const { handleGoodsIssue }    = require('./goodsIssueAuto');
+const { handleBatchComplete } = require('./batchCompleteAuto');
+const { handleDispatch }      = require('./dispatchAuto');
 
 async function processPendingEvents() {
-  // Get all pending sync_log entries
   const { data: pending, error } = await supabase
     .from('sync_log')
     .select('*')
@@ -35,13 +34,44 @@ async function processPendingEvents() {
   console.log(`\n[${new Date().toISOString()}] Found ${pending.length} pending event(s)`);
 
   for (const event of pending) {
+
+    // ── Idempotency check ──────────────────────────────────────
+    // If this exact reference + event_type was already successfully
+    // processed, skip it and mark as duplicate — do not process twice
+    const { data: alreadyDone } = await supabase
+      .from('sync_log')
+      .select('id')
+      .eq('reference_id', event.reference_id)
+      .eq('event_type', event.event_type)
+      .eq('status', 'success')
+      .neq('id', event.id)
+      .limit(1);
+
+    if (alreadyDone && alreadyDone.length > 0) {
+      console.log(`  ⚠️  Duplicate detected: ${event.event_type} for ${event.reference_id}`);
+      console.log(`      Already processed — marking as duplicate and skipping`);
+      await supabase
+        .from('sync_log')
+        .update({
+          status:      'success',
+          description: 'Duplicate — already processed successfully',
+          updated_at:  new Date().toISOString(),
+        })
+        .eq('id', event.id);
+      continue;
+    }
+    // ── End idempotency check ──────────────────────────────────
+
     console.log(`\nProcessing: ${event.event_type} — ${event.reference_type} — ${event.reference_id}`);
 
     try {
       // Mark as processing
       await supabase
         .from('sync_log')
-        .update({ status: 'processing', updated_at: new Date().toISOString() })
+        .update({
+          status:     'processing',
+          updated_at: new Date().toISOString(),
+        })
         .eq('id', event.id);
 
       // Route to correct handler
@@ -59,7 +89,16 @@ async function processPendingEvents() {
           await handleDispatch(event);
           break;
         default:
-          console.log(`  Unknown event type: ${event.event_type} — skipping`);
+          console.log(`  ⚠️  Unknown event type: ${event.event_type} — skipping`);
+          await supabase
+            .from('sync_log')
+            .update({
+              status:      'success',
+              description: `Unknown event type skipped: ${event.event_type}`,
+              updated_at:  new Date().toISOString(),
+            })
+            .eq('id', event.id);
+          continue;
       }
 
       // Mark as success
@@ -76,7 +115,6 @@ async function processPendingEvents() {
     } catch (err) {
       console.error(`  ❌ Failed: ${err.message}`);
 
-      // Mark as failed with error details
       await supabase
         .from('sync_log')
         .update({
@@ -91,7 +129,6 @@ async function processPendingEvents() {
   }
 }
 
-// Main polling loop
 async function startWorker() {
   console.log('==============================================');
   console.log(' HYPER Integration Bridge Worker');
@@ -99,8 +136,8 @@ async function startWorker() {
   console.log(` Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
   console.log('==============================================\n');
   console.log('Watching sync_log for pending events...');
+  console.log('Idempotency check: ENABLED — no duplicate processing\n');
 
-  // Run immediately then on interval
   await processPendingEvents();
   setInterval(processPendingEvents, POLL_INTERVAL_MS);
 }
