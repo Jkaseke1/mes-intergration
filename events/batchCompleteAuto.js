@@ -64,6 +64,21 @@ async function handleBatchComplete(syncEvent) {
   if (!sageCode) throw new Error(`No sage_code for formulation`);
   if (netQty <= 0) throw new Error(`Invalid net quantity: ${netQty}`);
 
+  // Calculate cost per unit from production order materials
+  const { data: materials } = await supabase
+    .from('production_order_materials')
+    .select('total_cost')
+    .eq('production_order_id', orderId);
+
+  const totalMaterialCost = materials?.reduce((sum, m) =>
+    sum + Number(m.total_cost || 0), 0) || 0;
+
+  const costPerUnit = netQty > 0
+    ? Math.round((totalMaterialCost / netQty) * 100) / 100
+    : 0;
+
+  console.log(`  Cost: $${totalMaterialCost.toFixed(2)} total / $${costPerUnit}/kg`);
+
   let pool;
   try {
     pool = await sql.connect(sageConfig);
@@ -92,7 +107,7 @@ async function handleBatchComplete(syncEvent) {
           .input('cDescription',  sql.VarChar,  description)
           .input('fQtyIn',        sql.Float,    netQty)
           .input('fQtyOut',       sql.Float,    0)
-          .input('fNewCost',      sql.Float,    Number(order.cost_per_unit || 0))
+          .input('fNewCost',      sql.Float,    costPerUnit)
           .input('bIsLotItem',    sql.Bit,      0)
           .input('bIsSerialItem', sql.Bit,      0)
           .query(`
