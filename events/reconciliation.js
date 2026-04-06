@@ -52,6 +52,7 @@ async function runReconciliation() {
         WHERE q.WhseID = 18
         AND s.ItemActive = 1
         AND s.ServiceItem = 0
+        AND s.StkItem_dCreatedDate >= '2026-03-28'
         ORDER BY s.Code
       `);
 
@@ -214,7 +215,7 @@ async function runReconciliation() {
         .from('sync_log')
         .insert({
           status:      variances > 0 ? 'variance' : 'success',
-          description: `Nightly reconciliation: ${matched} matched, ${variances} variances, ${missing} missing`,
+          description: `Nightly reconciliation: ${matched} matched, ${variances} variances, ${missing} not in MES (historical)`,
           environment: process.env.NODE_ENV,
           created_at:  new Date().toISOString(),
         });
