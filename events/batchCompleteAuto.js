@@ -55,8 +55,8 @@ async function handleBatchComplete(syncEvent) {
 
   if (error || !order) throw new Error(`Production order not found: ${orderId}`);
 
-  const sageCode  = order.formulations?.sage_code;
-  const netQty    = Number(order.actual_qty || 0) - Number(order.rejected_qty || 0);
+  const sageCode = order.formulations?.sage_code;
+  const netQty   = Number(order.actual_qty || 0) - Number(order.rejected_qty || 0);
 
   console.log(`  Batch: ${order.batch_number}`);
   console.log(`  Product: ${sageCode} — ${netQty}kg net`);
@@ -67,11 +67,11 @@ async function handleBatchComplete(syncEvent) {
   // Calculate cost per unit from production order materials
   const { data: materials } = await supabase
     .from('production_order_materials')
-    .select('total_cost')
+    .select('unit_cost, actual_qty')
     .eq('production_order_id', orderId);
 
   const totalMaterialCost = materials?.reduce((sum, m) =>
-    sum + Number(m.total_cost || 0), 0) || 0;
+    sum + (Number(m.unit_cost || 0) * Number(m.actual_qty || 0)), 0) || 0;
 
   const costPerUnit = netQty > 0
     ? Math.round((totalMaterialCost / netQty) * 100) / 100

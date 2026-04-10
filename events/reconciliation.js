@@ -52,7 +52,6 @@ async function runReconciliation() {
         WHERE q.WhseID = 18
         AND s.ItemActive = 1
         AND s.ServiceItem = 0
-        AND s.StkItem_dCreatedDate >= '2026-03-28'
         ORDER BY s.Code
       `);
 
