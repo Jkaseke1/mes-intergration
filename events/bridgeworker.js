@@ -15,6 +15,9 @@ const { handleGoodsReceipt }  = require('./goodsReceiptAuto');
 const { handleGoodsIssue }    = require('./goodsIssueAuto');
 const { handleBatchComplete } = require('./batchCompleteAuto');
 const { handleDispatch }      = require('./dispatchAuto');
+const { handleMacroPackComplete } = require('./macroPackCompleteAuto');
+const { handleReconVariance }     = require('./reconVarianceAuto');
+const { handleRMCostUpdate }      = require('./rmCostUpdateAuto');
 
 async function processPendingEvents() {
   const { data: pending, error } = await supabase
@@ -87,6 +90,15 @@ async function processPendingEvents() {
           break;
         case 'dispatch_delivered':
           await handleDispatch(event);
+          break;
+        case 'macropack_manufactured':
+          await handleMacroPackComplete(event);
+          break;
+        case 'reconciliation_variance_approved':
+          await handleReconVariance(event);
+          break;
+        case 'rm_cost_updated':
+          await handleRMCostUpdate(event);
           break;
         default:
           console.log(`  ⚠️  Unknown event type: ${event.event_type} — skipping`);
