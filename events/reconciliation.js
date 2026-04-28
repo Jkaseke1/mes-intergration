@@ -73,6 +73,8 @@ async function runReconciliation() {
         AND s.Code NOT LIKE 'CALSTAT%'
         AND s.Code NOT LIKE 'PGM5%'
         AND s.Code NOT IN ('DOC','LDOC001','CEM50','BAR0002','DFR0001','REC0001','REC0002','RECFIN','RECST','REF0001','PUL0001','HDC10','HDC8','PCWM50','PDBSM50','PGM50')
+        AND s.Code NOT LIKE 'GEP%'
+        AND q.QtyOnHand > 0
         ORDER BY s.Code
       `);
 
@@ -234,7 +236,7 @@ async function runReconciliation() {
       const { error: logError } = await supabase
         .from('sync_log')
         .insert({
-          event_type:     'nightly_reconciliation',
+          event_type:     'reconciliation_completed',
           reference_type: 'reconciliation',
           reference_id:   require('crypto').randomUUID(),
           status:         'success',
