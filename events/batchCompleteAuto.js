@@ -87,11 +87,10 @@ async function handleBatchComplete(syncEvent) {
 
         const costResult = await pool.request()
           .input('Code', sql.VarChar, matSageCode)
-          .input('WhseID', sql.Int, 18)
           .query(`
             SELECT TOP 1 AverageCost
             FROM _bvWarehouseStockFull
-            WHERE Code = @Code AND WhseID = @WhseID
+            WHERE Code = @Code
           `);
 
         const avgCost = costResult.recordset[0]?.AverageCost || 0;
