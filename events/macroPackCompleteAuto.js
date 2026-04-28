@@ -96,11 +96,39 @@ async function handleMacroPackComplete(syncEvent) {
     console.log(`  RM: ${rm?.sage_code} — dispensed ${issue.actual_grams_dispensed}g`);
   }
 
+  const costMap = {}; // sageCode -> fAverageCost from Sage
+  let totalCostUSD = 0;
+  let costPerUnit = 0;
+
   let pool;
   try {
     pool = await sql.connect(sageConfig);
     const trDate = new Date(order.manufacture_date || new Date());
     const macroCode = bom?.macropack_code || 'MP';
+
+    // Fetch average costs from Sage for each ingredient
+    for (const issue of issues) {
+      const sageCode = issue.raw_materials?.sage_code;
+      if (!sageCode) continue;
+      const costResult = await pool.request()
+        .input('Code', sql.VarChar, sageCode)
+        .input('WhseID', sql.Int, 18)
+        .query(`
+          SELECT ws.fAverageCost
+          FROM StkItem si
+          JOIN WhseStk ws ON ws.WHStockLink = si.StockLink AND ws.WHWhseID = @WhseID
+          WHERE si.Code = @Code AND si.ItemActive = 1
+        `);
+      const avgCost = costResult.recordset[0]?.fAverageCost || 0;
+      costMap[sageCode] = avgCost;
+      const qtyKg = Number(issue.actual_grams_dispensed || 0) / 1000;
+      totalCostUSD += qtyKg * avgCost;
+      console.log(`  Cost: ${sageCode} @ $${avgCost}/kg × ${qtyKg.toFixed(4)}kg = $${(qtyKg * avgCost).toFixed(4)}`);
+    }
+
+    const actualUnits = Number(order.actual_units || order.planned_units || 1);
+    costPerUnit = actualUnits > 0 ? totalCostUSD / actualUnits : 0;
+    console.log(`  Total ingredient cost: $${totalCostUSD.toFixed(4)} / ${actualUnits} units = $${costPerUnit.toFixed(4)}/unit`);
 
     // Step 1: Issue each ingredient from RM warehouse (WhseID 18)
     for (const issue of issues) {
@@ -147,7 +175,7 @@ async function handleMacroPackComplete(syncEvent) {
             .input('cDescription',  sql.VarChar,  description)
             .input('fQtyIn',        sql.Float,    0)
             .input('fQtyOut',       sql.Float,    qtyKg)
-            .input('fNewCost',      sql.Float,    0)
+            .input('fNewCost',      sql.Float,    costMap[sageCode] || 0)
             .input('bIsLotItem',    sql.Bit,      0)
             .input('bIsSerialItem', sql.Bit,      0)
             .query(`
@@ -208,7 +236,7 @@ async function handleMacroPackComplete(syncEvent) {
               .input('cDescription',  sql.VarChar,  wipDesc)
               .input('fQtyIn',        sql.Float,    wipUnits)
               .input('fQtyOut',       sql.Float,    0)
-              .input('fNewCost',      sql.Float,    0)
+              .input('fNewCost',      sql.Float,    costPerUnit)
               .input('bIsLotItem',    sql.Bit,      0)
               .input('bIsSerialItem', sql.Bit,      0)
               .query(`
@@ -263,6 +291,23 @@ async function handleMacroPackComplete(syncEvent) {
     }
   } finally {
     if (pool) await sql.close();
+  }
+
+  // Write calculated cost back to Supabase
+  if (costPerUnit > 0) {
+    const { error: costUpdateError } = await supabase
+      .from('macropack_manufacture_orders')
+      .update({
+        cost_per_unit: costPerUnit,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', orderId);
+
+    if (costUpdateError) {
+      console.warn(`  ⚠️  cost_per_unit write to Supabase failed: ${costUpdateError.message}`);
+    } else {
+      console.log(`  ✅ cost_per_unit saved to Supabase: $${costPerUnit.toFixed(4)}`);
+    }
   }
 }
 
