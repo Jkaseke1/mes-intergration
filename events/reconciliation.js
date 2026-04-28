@@ -236,7 +236,7 @@ async function runReconciliation() {
         .insert({
           event_type:     'nightly_reconciliation',
           reference_type: 'reconciliation',
-          reference_id:   `recon-${new Date().toISOString().split('T')[0]}`,
+          reference_id:   require('crypto').randomUUID(),
           status:         'success',
           description:    `Nightly reconciliation: ${matched} matched, ${variances} variances, ${missing} not in MES`,
           created_at:     new Date().toISOString(),
