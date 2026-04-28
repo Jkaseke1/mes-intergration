@@ -52,6 +52,27 @@ async function runReconciliation() {
         WHERE q.WhseID = 18
         AND s.ItemActive = 1
         AND s.ServiceItem = 0
+        AND s.Code NOT LIKE 'PA%'
+        AND s.Code NOT LIKE 'PIP%'
+        AND s.Code NOT LIKE 'PLD%'
+        AND s.Code NOT LIKE 'PCWM%'
+        AND s.Code NOT LIKE 'PDBSM%'
+        AND s.Code NOT LIKE 'PGM%'
+        AND s.Code NOT LIKE 'BSC%'
+        AND s.Code NOT LIKE 'BGP1%'
+        AND s.Code NOT LIKE 'BGP2%'
+        AND s.Code NOT LIKE 'BGP5%'
+        AND s.Code NOT LIKE 'BGF%'
+        AND s.Code NOT LIKE 'BSG%'
+        AND s.Code NOT LIKE 'BFP2%'
+        AND s.Code NOT LIKE 'BFP5%'
+        AND s.Code NOT LIKE 'LPM%'
+        AND s.Code NOT LIKE 'RRG%'
+        AND s.Code NOT LIKE 'RRL%'
+        AND s.Code NOT LIKE 'CALGRO%'
+        AND s.Code NOT LIKE 'CALSTAT%'
+        AND s.Code NOT LIKE 'PGM5%'
+        AND s.Code NOT IN ('DOC','LDOC001','CEM50','BAR0002','DFR0001','REC0001','REC0002','RECFIN','RECST','REF0001','PUL0001','HDC10','HDC8','PCWM50','PDBSM50','PGM50')
         ORDER BY s.Code
       `);
 
@@ -213,10 +234,12 @@ async function runReconciliation() {
       const { error: logError } = await supabase
         .from('sync_log')
         .insert({
-          status:      variances > 0 ? 'variance' : 'success',
-          description: `Nightly reconciliation: ${matched} matched, ${variances} variances, ${missing} not in MES (historical)`,
-          environment: process.env.NODE_ENV,
-          created_at:  new Date().toISOString(),
+          event_type:     'nightly_reconciliation',
+          reference_type: 'reconciliation',
+          reference_id:   `recon-${new Date().toISOString().split('T')[0]}`,
+          status:         'success',
+          description:    `Nightly reconciliation: ${matched} matched, ${variances} variances, ${missing} not in MES`,
+          created_at:     new Date().toISOString(),
         });
 
       if (logError) {
