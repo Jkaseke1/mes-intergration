@@ -243,7 +243,7 @@ async function runReconciliation() {
         });
 
       if (logError) {
-        console.log('\n⚠️  Could not write to sync_log');
+        console.log('\n⚠️  Could not write to sync_log:', JSON.stringify(logError));
       } else {
         console.log('\n✅ Results logged to sync_log');
       }
