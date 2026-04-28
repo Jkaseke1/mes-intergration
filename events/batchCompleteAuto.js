@@ -64,24 +64,49 @@ async function handleBatchComplete(syncEvent) {
   if (!sageCode) throw new Error(`No sage_code for formulation`);
   if (netQty <= 0) throw new Error(`Invalid net quantity: ${netQty}`);
 
-  // Calculate cost per unit from production order materials
+  // Fetch production order materials with sage_code for cost lookup
   const { data: materials } = await supabase
     .from('production_order_materials')
-    .select('unit_cost, actual_qty')
+    .select('actual_qty, raw_material_id, raw_materials(sage_code, name)')
     .eq('production_order_id', orderId);
 
-  const totalMaterialCost = materials?.reduce((sum, m) =>
-    sum + (Number(m.unit_cost || 0) * Number(m.actual_qty || 0)), 0) || 0;
-
-  const costPerUnit = netQty > 0
-    ? Math.round((totalMaterialCost / netQty) * 100) / 100
-    : 0;
-
-  console.log(`  Cost: $${totalMaterialCost.toFixed(2)} total / $${costPerUnit}/kg`);
+  // Cost calculated after Sage connection using live fAverageCost
+  let totalMaterialCost = 0;
+  let costPerUnit = 0;
 
   let pool;
   try {
     pool = await sql.connect(sageConfig);
+
+    // Fetch live average costs from Sage WhseStk for each ingredient
+    if (materials && materials.length > 0) {
+      for (const mat of materials) {
+        const matSageCode = mat.raw_materials?.sage_code;
+        const actualQtyKg = Number(mat.actual_qty || 0);
+        if (!matSageCode || actualQtyKg <= 0) continue;
+
+        const costResult = await pool.request()
+          .input('Code', sql.VarChar, matSageCode)
+          .input('WhseID', sql.Int, 18)
+          .query(`
+            SELECT ws.fAverageCost
+            FROM StkItem si
+            JOIN WhseStk ws ON ws.WHStockLink = si.StockLink AND ws.WHWhseID = @WhseID
+            WHERE si.Code = @Code AND si.ItemActive = 1
+          `);
+
+        const avgCost = costResult.recordset[0]?.fAverageCost || 0;
+        const lineCost = actualQtyKg * avgCost;
+        totalMaterialCost += lineCost;
+        console.log(`  Cost: ${matSageCode} @ $${avgCost}/kg \u00d7 ${actualQtyKg.toFixed(4)}kg = $${lineCost.toFixed(4)}`);
+      }
+    }
+
+    costPerUnit = netQty > 0
+      ? Math.round((totalMaterialCost / netQty) * 10000) / 10000
+      : 0;
+
+    console.log(`  Total material cost: $${totalMaterialCost.toFixed(4)} / ${netQty}kg = $${costPerUnit.toFixed(4)}/kg`);
 
     const stockResult = await pool.request()
       .input('Code', sql.VarChar, sageCode)
@@ -148,6 +173,23 @@ async function handleBatchComplete(syncEvent) {
     );
   } finally {
     if (pool) await sql.close();
+  }
+
+  // Write calculated cost_per_unit back to Supabase production_orders
+  if (costPerUnit > 0) {
+    const { error: costUpdateError } = await supabase
+      .from('production_orders')
+      .update({
+        cost_per_unit: costPerUnit,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', orderId);
+
+    if (costUpdateError) {
+      console.warn(`  cost_per_unit write to Supabase failed: ${costUpdateError.message}`);
+    } else {
+      console.log(`  cost_per_unit saved to Supabase: $${costPerUnit.toFixed(4)}/kg`);
+    }
   }
 }
 
