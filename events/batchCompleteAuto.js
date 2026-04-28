@@ -89,13 +89,12 @@ async function handleBatchComplete(syncEvent) {
           .input('Code', sql.VarChar, matSageCode)
           .input('WhseID', sql.Int, 18)
           .query(`
-            SELECT ws.fAverageCost
-            FROM StkItem si
-            JOIN WhseStk ws ON ws.WHStockLink = si.StockLink AND ws.WHWhseID = @WhseID
-            WHERE si.Code = @Code AND si.ItemActive = 1
+            SELECT TOP 1 AverageCost
+            FROM _bvWarehouseStockFull
+            WHERE Code = @Code AND WhseID = @WhseID
           `);
 
-        const avgCost = costResult.recordset[0]?.fAverageCost || 0;
+        const avgCost = costResult.recordset[0]?.AverageCost || 0;
         const lineCost = actualQtyKg * avgCost;
         totalMaterialCost += lineCost;
         console.log(`  Cost: ${matSageCode} @ $${avgCost}/kg \u00d7 ${actualQtyKg.toFixed(4)}kg = $${lineCost.toFixed(4)}`);

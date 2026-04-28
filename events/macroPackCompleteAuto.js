@@ -114,12 +114,11 @@ async function handleMacroPackComplete(syncEvent) {
         .input('Code', sql.VarChar, sageCode)
         .input('WhseID', sql.Int, 18)
         .query(`
-          SELECT ws.fAverageCost
-          FROM StkItem si
-          JOIN WhseStk ws ON ws.WHStockLink = si.StockLink AND ws.WHWhseID = @WhseID
-          WHERE si.Code = @Code AND si.ItemActive = 1
+          SELECT TOP 1 AverageCost
+          FROM _bvWarehouseStockFull
+          WHERE Code = @Code AND WhseID = @WhseID
         `);
-      const avgCost = costResult.recordset[0]?.fAverageCost || 0;
+      const avgCost = costResult.recordset[0]?.AverageCost || 0;
       costMap[sageCode] = avgCost;
       const qtyKg = Number(issue.actual_grams_dispensed || 0) / 1000;
       totalCostUSD += qtyKg * avgCost;
