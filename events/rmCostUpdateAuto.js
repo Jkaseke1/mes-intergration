@@ -23,23 +23,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function safeWrite(description, sqlFn) {
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would execute: ${description}`);
-    return { dryRun: true };
-  }
-  try {
-    const result = await sqlFn();
-    console.log(`[LIVE] ✅ Executed: ${description}`);
-    return result;
-  } catch (err) {
-    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
-    throw err;
-  }
-}
-
 async function handleRMCostUpdate(syncEvent) {
-  console.log('\n  → Event 9: RM Cost Update (Auto)');
+  console.log('\n  → Event 7: RM Cost Update (Auto)');
 
   const costEntryId = syncEvent.reference_id;
   console.log(`  Cost Entry ID: ${costEntryId}`);
@@ -55,7 +40,7 @@ async function handleRMCostUpdate(syncEvent) {
     throw new Error(`Cost entry not found: ${costEntryId} — ${costError?.message}`);
   }
 
-  // Do NOT fire if source = 'SAGE_SYNC' to avoid circular updates
+  // Skip circular updates from Sage sync
   if (costEntry.source === 'SAGE_SYNC') {
     console.log('  ⚠️  Source is SAGE_SYNC — skipping to avoid circular update');
     return;
@@ -63,7 +48,6 @@ async function handleRMCostUpdate(syncEvent) {
 
   console.log(`  Source: ${costEntry.source}`);
   console.log(`  Cost/tonne USD: ${costEntry.cost_per_tonne_usd}`);
-  console.log(`  Effective date: ${costEntry.effective_date}`);
 
   // Get raw material sage_code
   const { data: rm, error: rmError } = await supabase
@@ -82,80 +66,63 @@ async function handleRMCostUpdate(syncEvent) {
 
   console.log(`  Material: ${rm.sage_code} — ${rm.name}`);
 
-  // Convert cost/tonne to cost/kg for Sage (Sage typically stores per-unit cost)
+  // Convert cost/tonne to cost/kg
   const costPerKg = Number(costEntry.cost_per_tonne_usd) / 1000;
   console.log(`  Cost/kg USD: ${costPerKg.toFixed(6)}`);
 
-  let pool;
-  try {
-    pool = await sql.connect(sageConfig);
+  if (DRY_RUN) {
+    console.log(`[DRY RUN] Would update fAverageCost for ${rm.sage_code} to $${costPerKg.toFixed(6)}/kg`);
+    return;
+  }
 
-    // Find the matching item in Sage
+  const pool = await sql.connect(sageConfig);
+
+  try {
+    // Find StockLink from StkItem — no cost column needed here
     const stockResult = await pool.request()
       .input('Code', sql.VarChar, rm.sage_code)
-      .query(`SELECT StockLink, Description_1, AveUCst FROM StkItem WHERE Code = @Code AND ItemActive = 1`);
+      .query(`SELECT StockLink, Description_1 FROM StkItem WHERE Code = @Code AND ItemActive = 1`);
 
     if (stockResult.recordset.length === 0) {
       throw new Error(`${rm.sage_code} not found in Sage StkItem`);
     }
 
-    const stockLink  = stockResult.recordset[0].StockLink;
-    const currentCost = stockResult.recordset[0].AveUCst;
-
+    const stockLink = stockResult.recordset[0].StockLink;
     console.log(`  Sage StockLink: ${stockLink}`);
-    console.log(`  Current Sage cost: ${currentCost}`);
-    console.log(`  New cost/kg: ${costPerKg.toFixed(6)}`);
 
-    // Update WhseStk.fAverageCost for warehouse 18 (RM warehouse)
-    await safeWrite(
-      `Update average cost for ${rm.sage_code} in WhseID 18 to ${costPerKg.toFixed(6)}`,
-      async () => {
-        // Update the warehouse-level average cost
-        const whseResult = await pool.request()
-          .input('StockID', sql.Int, stockLink)
-          .input('WhseID',  sql.Int, 18)
-          .query(`
-            SELECT idWhseStk FROM WhseStk 
-            WHERE StockID = @StockID AND WhseID = @WhseID
-          `);
+    // Update WhseStk.fAverageCost for RM warehouse (WhseID 18)
+    // WhseStk uses WHStockLink and WHWhseID (confirmed from schema)
+    const whseResult = await pool.request()
+      .input('StockLink', sql.Int, stockLink)
+      .input('WhseID',    sql.Int, 18)
+      .query(`
+        SELECT IdWhseStk, fAverageCost
+        FROM WhseStk
+        WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
+      `);
 
-        if (whseResult.recordset.length > 0) {
-          await pool.request()
-            .input('StockID',  sql.Int,   stockLink)
-            .input('WhseID',   sql.Int,   18)
-            .input('NewCost',  sql.Float, costPerKg)
-            .query(`
-              UPDATE WhseStk 
-              SET fAverageCost = @NewCost 
-              WHERE StockID = @StockID AND WhseID = @WhseID
-            `);
-        } else {
-          console.log(`  ⚠️  No WhseStk record for ${rm.sage_code} in WhseID 18 — creating`);
-          await pool.request()
-            .input('StockID',  sql.Int,   stockLink)
-            .input('WhseID',   sql.Int,   18)
-            .input('NewCost',  sql.Float, costPerKg)
-            .query(`
-              INSERT INTO WhseStk (StockID, WhseID, fAverageCost) 
-              VALUES (@StockID, @WhseID, @NewCost)
-            `);
-        }
+    if (whseResult.recordset.length > 0) {
+      const currentCost = whseResult.recordset[0].fAverageCost;
+      console.log(`  Current Sage cost: $${currentCost}/kg`);
 
-        // Also update the master StkItem average cost
-        await pool.request()
-          .input('StockLink', sql.Int,   stockLink)
-          .input('NewCost',   sql.Float, costPerKg)
-          .query(`
-            UPDATE StkItem 
-            SET AveUCst = @NewCost 
-            WHERE StockLink = @StockLink
-          `);
-      }
-    );
+      await pool.request()
+        .input('StockLink', sql.Int,   stockLink)
+        .input('WhseID',    sql.Int,   18)
+        .input('NewCost',   sql.Float, costPerKg)
+        .query(`
+          UPDATE WhseStk
+          SET fAverageCost = @NewCost
+          WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
+        `);
+      console.log(`  ✅ fAverageCost updated: ${rm.sage_code} $${currentCost} → $${costPerKg.toFixed(6)}/kg`);
+    } else {
+      // No WhseStk row — no INSERT permission, log as non-critical
+      console.log(`  ℹ️  No WhseStk row for ${rm.sage_code} WhseID=18 — cost not updated (non-critical)`);
+    }
 
-    console.log(`  Cost updated: ${rm.sage_code} → $${costPerKg.toFixed(6)}/kg`);
   } finally {
-    if (pool) await sql.close();
+    await sql.close();
+    console.log(`  Connection closed.`);
   }
 }
 

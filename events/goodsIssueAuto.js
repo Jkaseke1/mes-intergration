@@ -91,10 +91,22 @@ async function handleGoodsIssue(syncEvent) {
     const reference   = `WO-${batchNumber}`.substring(0, 20);
     const description = `Issue to ${batchNumber}`.substring(0, 40);
 
+    // Check current stock before issuing
+    const stockCheck = await pool.request()
+      .input('StockID', sql.Int, stockLink)
+      .input('WhseID',  sql.Int, 18)
+      .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
+
+    const currentStock = stockCheck.recordset.length > 0 ? stockCheck.recordset[0].QtyOnHand : 0;
+    
+    if (currentStock < actualQty) {
+      throw new Error(`Insufficient stock: ${sageCode} has ${currentStock}kg but ${actualQty}kg requested`);
+    }
+
     await safeWrite(
       `Issue ${actualQty}kg of ${sageCode} for ${batchNumber}`,
       async () => {
-        await pool.request()
+        const journalResult = await pool.request()
           .input('iInvJrBatchID', sql.Int,      2)
           .input('iStockID',      sql.Int,      stockLink)
           .input('iWarehouseID',  sql.Int,      18)
@@ -106,6 +118,8 @@ async function handleGoodsIssue(syncEvent) {
           .input('fQtyIn',        sql.Float,    0)
           .input('fQtyOut',       sql.Float,    actualQty)
           .input('fNewCost',      sql.Float,    Number(material.unit_cost || 0))
+          .input('iProjectID',    sql.Int,      0)
+          .input('iJobID',        sql.Int,      0)
           .input('bIsLotItem',    sql.Bit,      0)
           .input('bIsSerialItem', sql.Bit,      0)
           .query(`
@@ -114,15 +128,21 @@ async function handleGoodsIssue(syncEvent) {
               dTrDate, iTrCodeID, iGLContraID,
               cReference, cDescription,
               fQtyIn, fQtyOut, fNewCost,
+              iProjectID, iJobID,
               bIsLotItem, bIsSerialItem
-            ) VALUES (
+            ) OUTPUT INSERTED.idInvJrBatchLines
+            VALUES (
               @iInvJrBatchID, @iStockID, @iWarehouseID,
               @dTrDate, @iTrCodeID, @iGLContraID,
               @cReference, @cDescription,
               @fQtyIn, @fQtyOut, @fNewCost,
+              @iProjectID, @iJobID,
               @bIsLotItem, @bIsSerialItem
             )
           `);
+
+        const insertedId = journalResult.recordset?.[0]?.idInvJrBatchLines;
+        console.log(`  📌 Sage journal line idInvJrBatchLines = ${insertedId}`);
 
         await pool.request()
           .input('StockID', sql.Int,   stockLink)

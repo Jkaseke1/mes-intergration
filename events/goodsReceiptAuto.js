@@ -23,21 +23,6 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function safeWrite(description, sqlFn) {
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would execute: ${description}`);
-    return { dryRun: true };
-  }
-  try {
-    const result = await sqlFn();
-    console.log(`[LIVE] ✅ Executed: ${description}`);
-    return result;
-  } catch (err) {
-    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
-    throw err;
-  }
-}
-
 async function handleGoodsReceipt(syncEvent) {
   console.log('\n  → Event 1: Goods Receipt (Auto)');
 
@@ -55,7 +40,7 @@ async function handleGoodsReceipt(syncEvent) {
     throw new Error(`GRN not found: ${grnId} — ${grnError?.message}`);
   }
 
-  // Read supplier separately
+  // Read supplier
   const { data: supplier } = await supabase
     .from('suppliers')
     .select('id, name, sage_code')
@@ -64,25 +49,18 @@ async function handleGoodsReceipt(syncEvent) {
 
   console.log(`  GRN: ${grn.grn_number} — ${supplier?.name}`);
 
-  // Read GRN line items with debug
+  // Read GRN line items
   const { data: items, error: itemsError } = await supabase
     .from('grn_items')
     .select('id, received_qty, unit_cost, raw_material_id')
     .eq('grn_id', grnId);
 
-  console.log(`  Items debug: count=${items?.length} error=${itemsError?.message} data=${JSON.stringify(items)}`);
+  console.log(`  Items: count=${items?.length} error=${itemsError?.message}`);
 
-  if (itemsError) {
-    throw new Error(`Items query error: ${itemsError.message}`);
-  }
+  if (itemsError) throw new Error(`Items query error: ${itemsError.message}`);
+  if (!items || items.length === 0) throw new Error(`No items found for GRN: ${grn.grn_number}`);
 
-  if (!items || items.length === 0) {
-    throw new Error(`No items found for GRN: ${grn.grn_number}`);
-  }
-
-  console.log(`  Items: ${items.length} line(s)`);
-
-  // Fetch raw material details for each line
+  // Fetch raw material details
   for (const item of items) {
     const { data: rm } = await supabase
       .from('raw_materials')
@@ -90,13 +68,18 @@ async function handleGoodsReceipt(syncEvent) {
       .eq('id', item.raw_material_id)
       .single();
     item.raw_materials = rm;
-    console.log(`  RM lookup: ${item.raw_material_id} → ${rm?.name} (${rm?.sage_code})`);
+    console.log(`  RM: ${item.raw_material_id} → ${rm?.name} (${rm?.sage_code})`);
   }
 
-  let pool;
-  try {
-    pool = await sql.connect(sageConfig);
+  if (DRY_RUN) {
+    console.log(`[DRY RUN] Would write ${items.length} GRN line(s) to Sage`);
+    return;
+  }
 
+  // Single connection — held open for ALL operations
+  const pool = await sql.connect(sageConfig);
+
+  try {
     for (const item of items) {
       const sageCode = item.raw_materials?.sage_code;
       const rmName   = item.raw_materials?.name;
@@ -106,9 +89,10 @@ async function handleGoodsReceipt(syncEvent) {
         continue;
       }
 
+      // Look up StockLink
       const stockResult = await pool.request()
         .input('Code', sql.VarChar, sageCode)
-        .query(`SELECT StockLink, Description_1 FROM StkItem WHERE Code = @Code AND ItemActive = 1`);
+        .query(`SELECT StockLink FROM StkItem WHERE Code = @Code AND ItemActive = 1`);
 
       if (stockResult.recordset.length === 0) {
         console.log(`  ⚠️  ${sageCode} not found in Sage — skipping`);
@@ -118,75 +102,109 @@ async function handleGoodsReceipt(syncEvent) {
       const stockLink   = stockResult.recordset[0].StockLink;
       const reference   = grn.grn_number.substring(0, 20);
       const description = (rmName || sageCode).substring(0, 40);
+      const qty         = Number(item.received_qty);
+      const cost        = Number(item.unit_cost || 0);
 
-      console.log(`  Processing: ${sageCode} — ${item.received_qty}kg`);
+      console.log(`  Processing: ${sageCode} — ${qty}kg @ $${cost}`);
 
-      await safeWrite(
-        `GRN ${grn.grn_number} — ${sageCode} +${item.received_qty}kg`,
-        async () => {
-          await pool.request()
-            .input('iInvJrBatchID', sql.Int,      2)
-            .input('iStockID',      sql.Int,      stockLink)
-            .input('iWarehouseID',  sql.Int,      18)
-            .input('dTrDate',       sql.DateTime, new Date(grn.received_date))
-            .input('iTrCodeID',     sql.Int,      31)
-            .input('iGLContraID',   sql.Int,      0)
-            .input('cReference',    sql.VarChar,  reference)
-            .input('cDescription',  sql.VarChar,  description)
-            .input('fQtyIn',        sql.Float,    Number(item.received_qty))
-            .input('fQtyOut',       sql.Float,    0)
-            .input('fNewCost',      sql.Float,    Number(item.unit_cost || 0))
-            .input('bIsLotItem',    sql.Bit,      0)
-            .input('bIsSerialItem', sql.Bit,      0)
-            .query(`
-              INSERT INTO _etblInvJrBatchLines (
-                iInvJrBatchID, iStockID, iWarehouseID,
-                dTrDate, iTrCodeID, iGLContraID,
-                cReference, cDescription,
-                fQtyIn, fQtyOut, fNewCost,
-                bIsLotItem, bIsSerialItem
-              ) VALUES (
-                @iInvJrBatchID, @iStockID, @iWarehouseID,
-                @dTrDate, @iTrCodeID, @iGLContraID,
-                @cReference, @cDescription,
-                @fQtyIn, @fQtyOut, @fNewCost,
-                @bIsLotItem, @bIsSerialItem
-              )
-            `);
+      // STEP A — Write journal line
+      await pool.request()
+        .input('iInvJrBatchID', sql.Int,      2)
+        .input('iStockID',      sql.Int,      stockLink)
+        .input('iWarehouseID',  sql.Int,      18)
+        .input('dTrDate',       sql.DateTime, new Date(grn.received_date))
+        .input('iTrCodeID',     sql.Int,      31)
+        .input('iGLContraID',   sql.Int,      0)
+        .input('cReference',    sql.VarChar,  reference)
+        .input('cDescription',  sql.VarChar,  description)
+        .input('fQtyIn',        sql.Float,    qty)
+        .input('fQtyOut',       sql.Float,    0)
+        .input('fNewCost',      sql.Float,    cost)
+        .input('bIsLotItem',    sql.Bit,      0)
+        .input('bIsSerialItem', sql.Bit,      0)
+        .query(`
+          INSERT INTO _etblInvJrBatchLines (
+            iInvJrBatchID, iStockID, iWarehouseID,
+            dTrDate, iTrCodeID, iGLContraID,
+            cReference, cDescription,
+            fQtyIn, fQtyOut, fNewCost,
+            bIsLotItem, bIsSerialItem
+          ) VALUES (
+            @iInvJrBatchID, @iStockID, @iWarehouseID,
+            @dTrDate, @iTrCodeID, @iGLContraID,
+            @cReference, @cDescription,
+            @fQtyIn, @fQtyOut, @fNewCost,
+            @bIsLotItem, @bIsSerialItem
+          )
+        `);
 
-          const existing = await pool.request()
-            .input('StockID', sql.Int, stockLink)
-            .input('WhseID',  sql.Int, 18)
-            .query(`
-              SELECT idStockQtys FROM _etblStockQtys 
-              WHERE StockID = @StockID AND WhseID = @WhseID
-            `);
+      console.log(`  ✅ Journal line written: ${sageCode} +${qty}kg`);
 
-          if (existing.recordset.length > 0) {
-            await pool.request()
-              .input('StockID', sql.Int,   stockLink)
-              .input('WhseID',  sql.Int,   18)
-              .input('QtyIn',   sql.Float, Number(item.received_qty))
-              .query(`
-                UPDATE _etblStockQtys 
-                SET QtyOnHand = QtyOnHand + @QtyIn 
-                WHERE StockID = @StockID AND WhseID = @WhseID
-              `);
-          } else {
-            await pool.request()
-              .input('StockID', sql.Int,   stockLink)
-              .input('WhseID',  sql.Int,   18)
-              .input('QtyIn',   sql.Float, Number(item.received_qty))
-              .query(`
-                INSERT INTO _etblStockQtys (StockID, WhseID, QtyOnHand) 
-                VALUES (@StockID, @WhseID, @QtyIn)
-              `);
-          }
-        }
-      );
+      // STEP B — Update QtyOnHand on same connection, same pool
+      const existing = await pool.request()
+        .input('StockID', sql.Int, stockLink)
+        .input('WhseID',  sql.Int, 18)
+        .query(`
+          SELECT idStockQtys, QtyOnHand
+          FROM _etblStockQtys
+          WHERE StockID = @StockID AND WhseID = @WhseID
+        `);
+
+      if (existing.recordset.length > 0) {
+        const before = existing.recordset[0].QtyOnHand;
+        await pool.request()
+          .input('StockID', sql.Int,   stockLink)
+          .input('WhseID',  sql.Int,   18)
+          .input('QtyIn',   sql.Float, qty)
+          .query(`
+            UPDATE _etblStockQtys
+            SET QtyOnHand = QtyOnHand + @QtyIn
+            WHERE StockID = @StockID AND WhseID = @WhseID
+          `);
+        console.log(`  ✅ QtyOnHand updated: ${before} → ${before + qty} (${sageCode} WhseID=18)`);
+      } else {
+        await pool.request()
+          .input('StockID', sql.Int,   stockLink)
+          .input('WhseID',  sql.Int,   18)
+          .input('QtyIn',   sql.Float, qty)
+          .query(`
+            INSERT INTO _etblStockQtys (StockID, WhseID, QtyOnHand)
+            VALUES (@StockID, @WhseID, @QtyIn)
+          `);
+        console.log(`  ✅ QtyOnHand inserted: ${qty} (${sageCode} WhseID=18 — new row)`);
+      }
+
+      // STEP C — Update average cost (WhseStk uses WHStockLink + WHWhseID)
+      const whseResult = await pool.request()
+        .input('StockLink', sql.Int, stockLink)
+        .input('WhseID',    sql.Int, 18)
+        .query(`
+          SELECT IdWhseStk, fAverageCost
+          FROM WhseStk
+          WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
+        `);
+
+      if (whseResult.recordset.length > 0) {
+        await pool.request()
+          .input('StockLink', sql.Int,   stockLink)
+          .input('WhseID',    sql.Int,   18)
+          .input('NewCost',   sql.Float, cost)
+          .query(`
+            UPDATE WhseStk
+            SET fAverageCost = @NewCost
+            WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
+          `);
+        console.log(`  ✅ Average cost updated: ${sageCode} → $${cost}/kg (WhseStk)`);
+      } else {
+        // No WhseStk row — skip cost update, stock qty already correct in _etblStockQtys
+        console.log(`  ℹ️  No WhseStk row for ${sageCode} WhseID=18 — fAverageCost not set (non-critical)`);
+      }
     }
+
   } finally {
-    if (pool) await sql.close();
+    // Close ONCE after all operations complete
+    await sql.close();
+    console.log(`  Connection closed.`);
   }
 }
 

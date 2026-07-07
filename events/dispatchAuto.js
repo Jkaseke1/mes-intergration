@@ -113,11 +113,23 @@ async function handleDispatch(syncEvent) {
 
       console.log(`  Item: ${sageCode} — ${qty}kg to warehouse ${destWhseLink}`);
 
+      // Check DSP warehouse stock before dispatching
+      const stockCheck = await pool.request()
+        .input('StockID', sql.Int, stockLink)
+        .input('WhseID',  sql.Int, 20)
+        .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
+
+      const currentStock = stockCheck.recordset.length > 0 ? stockCheck.recordset[0].QtyOnHand : 0;
+      
+      if (currentStock < qty) {
+        throw new Error(`Insufficient stock in DSP: ${sageCode} has ${currentStock}kg but ${qty}kg requested`);
+      }
+
       await safeWrite(
         `Dispatch ${qty}kg of ${sageCode} to ${dispatch.branches?.name}`,
         async () => {
           // Issue from DSP
-          await pool.request()
+          const dspIssueResult = await pool.request()
             .input('iInvJrBatchID', sql.Int,      1)
             .input('iStockID',      sql.Int,      stockLink)
             .input('iWarehouseID',  sql.Int,      20)
@@ -129,6 +141,8 @@ async function handleDispatch(syncEvent) {
             .input('fQtyIn',        sql.Float,    0)
             .input('fQtyOut',       sql.Float,    qty)
             .input('fNewCost',      sql.Float,    Number(item.unit_price || 0))
+            .input('iProjectID',    sql.Int,      0)
+            .input('iJobID',        sql.Int,      0)
             .input('bIsLotItem',    sql.Bit,      0)
             .input('bIsSerialItem', sql.Bit,      0)
             .query(`
@@ -137,12 +151,15 @@ async function handleDispatch(syncEvent) {
                 dTrDate, iTrCodeID, iGLContraID,
                 cReference, cDescription,
                 fQtyIn, fQtyOut, fNewCost,
+                iProjectID, iJobID,
                 bIsLotItem, bIsSerialItem
-              ) VALUES (
+              ) OUTPUT INSERTED.idInvJrBatchLines
+              VALUES (
                 @iInvJrBatchID, @iStockID, @iWarehouseID,
                 @dTrDate, @iTrCodeID, @iGLContraID,
                 @cReference, @cDescription,
                 @fQtyIn, @fQtyOut, @fNewCost,
+                @iProjectID, @iJobID,
                 @bIsLotItem, @bIsSerialItem
               )
             `);
@@ -154,7 +171,7 @@ async function handleDispatch(syncEvent) {
             .query(`UPDATE _etblStockQtys SET QtyOnHand = QtyOnHand - @QtyOut WHERE StockID = @StockID AND WhseID = @WhseID`);
 
           // Receive into branch
-          await pool.request()
+          const branchReceiptResult = await pool.request()
             .input('iInvJrBatchID', sql.Int,      1)
             .input('iStockID',      sql.Int,      stockLink)
             .input('iWarehouseID',  sql.Int,      destWhseLink)
@@ -166,6 +183,8 @@ async function handleDispatch(syncEvent) {
             .input('fQtyIn',        sql.Float,    qty)
             .input('fQtyOut',       sql.Float,    0)
             .input('fNewCost',      sql.Float,    Number(item.unit_price || 0))
+            .input('iProjectID',    sql.Int,      0)
+            .input('iJobID',        sql.Int,      0)
             .input('bIsLotItem',    sql.Bit,      0)
             .input('bIsSerialItem', sql.Bit,      0)
             .query(`
@@ -174,15 +193,20 @@ async function handleDispatch(syncEvent) {
                 dTrDate, iTrCodeID, iGLContraID,
                 cReference, cDescription,
                 fQtyIn, fQtyOut, fNewCost,
+                iProjectID, iJobID,
                 bIsLotItem, bIsSerialItem
-              ) VALUES (
+              ) OUTPUT INSERTED.idInvJrBatchLines
+              VALUES (
                 @iInvJrBatchID, @iStockID, @iWarehouseID,
                 @dTrDate, @iTrCodeID, @iGLContraID,
                 @cReference, @cDescription,
                 @fQtyIn, @fQtyOut, @fNewCost,
+                @iProjectID, @iJobID,
                 @bIsLotItem, @bIsSerialItem
               )
             `);
+
+          console.log(`  📌 DSP issue idInvJrBatchLines = ${dspIssueResult.recordset?.[0]?.idInvJrBatchLines}, branch receipt idInvJrBatchLines = ${branchReceiptResult.recordset?.[0]?.idInvJrBatchLines}`);
 
           const branchQty = await pool.request()
             .input('StockID', sql.Int, stockLink)
