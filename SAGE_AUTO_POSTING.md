@@ -38,11 +38,54 @@ This fixes the issue where stock was updated manually but the journal batch line
 4. Update `hyper-integration/.env` with the new values (see `.env.example`).
 
 ## Deployment steps
-1. Stop the bridge worker.
-2. Run `sql/PostInventoryTxV2.sql` in Sage.
-3. Update `.env` with the correct transaction codes and GL account codes.
-4. Review and run `sql/fix_unposted_batch_lines.sql` to clean old unposted lines.
-5. Start the bridge worker.
+
+### Step 1 — Supabase schema
+1. Ensure the `20260421_sync_log_expand_checks.sql` migration has been applied (event types and statuses).
+2. Apply the `HYPER MES/supabase/migrations/20260710_sage_posting_bridge_enhancements.sql` migration:
+   ```bash
+   cd "C:\Users\Joseph Kaseke\CascadeProjects\HYPER MES"
+   supabase db push
+   ```
+   This adds:
+   - `formulation_id` and `macropack_bom_id` columns to `sage_stock_balances`.
+   - Triggers for `macropack_manufactured` and `reconciliation_variance_approved`.
+   - Updated `set_sage_stock_balance` / `update_sage_stock_balance` functions that resolve `sage_code` from `raw_materials`, `formulations`, and `macropack_boms`.
+
+### Step 2 — Sage side
+1. Backup the Sage database.
+2. Run `sql/PostInventoryTxV2.sql` in SQL Server Management Studio or via `node tools/create-sage-sp.js`:
+   ```bash
+   cd "C:\Users\Joseph Kaseke\CascadeProjects\hyper-integration"
+   node tools/create-sage-sp.js
+   ```
+3. Run `sql/fix_unposted_batch_lines.sql` to remove legacy unposted batch lines.
+
+### Step 3 — Configuration
+1. Copy `.env.example` to `.env`.
+2. Verify `SAGE_DATABASE`, `SAGE_USER`, `SAGE_PASSWORD`, and Supabase keys.
+3. Confirm transaction code defaults:
+   ```
+   SAGE_TX_CODE_GRN=GRV
+   SAGE_TX_CODE_ISSUE=MFDR
+   SAGE_TX_CODE_PRODUCTION=MFMF
+   SAGE_TX_CODE_DISPATCH=WHT
+   SAGE_TX_CODE_RECON=ADJ
+   SAGE_TX_CODE_MACROPACK=MFMF
+   ```
+4. Optional: set `SAGE_GL_ACCOUNT_RECON` (e.g. `2200-DEB-1120`) for recon variance overrides.
+
+### Step 4 — Bridge worker
+1. Stop the old bridge worker.
+2. Start the new bridge worker:
+   ```bash
+   cd "C:\Users\Joseph Kaseke\CascadeProjects\hyper-integration"
+   node events/bridgeworker.js
+   ```
+
+### Step 5 — Smoke tests
+1. Run `node tools/test-sage-flow-v2.js` to post a tiny GRN → issue → production → dispatch flow.
+2. Run `node tools/verify-sage-postings-v2.js <suffix>` to confirm stock and GL entries.
+3. In the MES app, create/approve a GRN, issue materials, complete a batch, and dispatch — verify `sync_log` becomes `success`.
 
 ## Testing the stored procedure
 1. Edit `sql/test_post_inventory_tx.sql` with a test stock code, warehouse code, transaction code, and GL account.
