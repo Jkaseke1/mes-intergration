@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
+const { postInventoryTransaction } = require('./lib/sagePost');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 
@@ -22,6 +23,21 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
+
+async function safeWrite(description, sqlFn) {
+  if (DRY_RUN) {
+    console.log(`[DRY RUN] Would execute: ${description}`);
+    return { dryRun: true };
+  }
+  try {
+    const result = await sqlFn();
+    console.log(`[LIVE] ✅ Executed: ${description}`);
+    return result;
+  } catch (err) {
+    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
+    throw err;
+  }
+}
 
 async function handleGoodsReceipt(syncEvent) {
   console.log('\n  → Event 1: Goods Receipt (Auto)');
@@ -71,15 +87,11 @@ async function handleGoodsReceipt(syncEvent) {
     console.log(`  RM: ${item.raw_material_id} → ${rm?.name} (${rm?.sage_code})`);
   }
 
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would write ${items.length} GRN line(s) to Sage`);
-    return;
-  }
-
   // Single connection — held open for ALL operations
-  const pool = await sql.connect(sageConfig);
-
+  let pool;
   try {
+    pool = await sql.connect(sageConfig);
+
     for (const item of items) {
       const sageCode = item.raw_materials?.sage_code;
       const rmName   = item.raw_materials?.name;
@@ -107,103 +119,74 @@ async function handleGoodsReceipt(syncEvent) {
 
       console.log(`  Processing: ${sageCode} — ${qty}kg @ $${cost}`);
 
-      // STEP A — Write journal line
-      await pool.request()
-        .input('iInvJrBatchID', sql.Int,      2)
-        .input('iStockID',      sql.Int,      stockLink)
-        .input('iWarehouseID',  sql.Int,      18)
-        .input('dTrDate',       sql.DateTime, new Date(grn.received_date))
-        .input('iTrCodeID',     sql.Int,      31)
-        .input('iGLContraID',   sql.Int,      0)
-        .input('cReference',    sql.VarChar,  reference)
-        .input('cDescription',  sql.VarChar,  description)
-        .input('fQtyIn',        sql.Float,    qty)
-        .input('fQtyOut',       sql.Float,    0)
-        .input('fNewCost',      sql.Float,    cost)
-        .input('bIsLotItem',    sql.Bit,      0)
-        .input('bIsSerialItem', sql.Bit,      0)
-        .query(`
-          INSERT INTO _etblInvJrBatchLines (
-            iInvJrBatchID, iStockID, iWarehouseID,
-            dTrDate, iTrCodeID, iGLContraID,
-            cReference, cDescription,
-            fQtyIn, fQtyOut, fNewCost,
-            bIsLotItem, bIsSerialItem
-          ) VALUES (
-            @iInvJrBatchID, @iStockID, @iWarehouseID,
-            @dTrDate, @iTrCodeID, @iGLContraID,
-            @cReference, @cDescription,
-            @fQtyIn, @fQtyOut, @fNewCost,
-            @bIsLotItem, @bIsSerialItem
-          )
-        `);
+      await safeWrite(
+        `GRN receipt: ${qty}kg of ${sageCode} @ $${cost}/kg`,
+        async () => {
+          // Post directly to Sage (no journal batch, no manual QtyOnHand)
+          await postInventoryTransaction(pool, {
+            sageCode,
+            transactionType: 'grn',
+            quantity: qty,
+            whseId: 18,
+            unitCost: cost,
+            reference,
+            description,
+            transactionDate: new Date(grn.received_date)
+          });
 
-      console.log(`  ✅ Journal line written: ${sageCode} +${qty}kg`);
+          console.log(`  ✅ Sage posted: ${sageCode} +${qty}kg into WhseID 18`);
 
-      // STEP B — Update QtyOnHand on same connection, same pool
-      const existing = await pool.request()
-        .input('StockID', sql.Int, stockLink)
-        .input('WhseID',  sql.Int, 18)
-        .query(`
-          SELECT idStockQtys, QtyOnHand
-          FROM _etblStockQtys
-          WHERE StockID = @StockID AND WhseID = @WhseID
-        `);
+          // Get current stock for Supabase sync
+          const existing = await pool.request()
+            .input('StockID', sql.Int, stockLink)
+            .input('WhseID',  sql.Int, 18)
+            .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
 
-      if (existing.recordset.length > 0) {
-        const before = existing.recordset[0].QtyOnHand;
-        await pool.request()
-          .input('StockID', sql.Int,   stockLink)
-          .input('WhseID',  sql.Int,   18)
-          .input('QtyIn',   sql.Float, qty)
-          .query(`
-            UPDATE _etblStockQtys
-            SET QtyOnHand = QtyOnHand + @QtyIn
-            WHERE StockID = @StockID AND WhseID = @WhseID
-          `);
-        console.log(`  ✅ QtyOnHand updated: ${before} → ${before + qty} (${sageCode} WhseID=18)`);
-      } else {
-        await pool.request()
-          .input('StockID', sql.Int,   stockLink)
-          .input('WhseID',  sql.Int,   18)
-          .input('QtyIn',   sql.Float, qty)
-          .query(`
-            INSERT INTO _etblStockQtys (StockID, WhseID, QtyOnHand)
-            VALUES (@StockID, @WhseID, @QtyIn)
-          `);
-        console.log(`  ✅ QtyOnHand inserted: ${qty} (${sageCode} WhseID=18 — new row)`);
-      }
+          const newQty = existing.recordset.length > 0 ? existing.recordset[0].QtyOnHand : qty;
 
-      // STEP C — Update average cost (WhseStk uses WHStockLink + WHWhseID)
-      const whseResult = await pool.request()
-        .input('StockLink', sql.Int, stockLink)
-        .input('WhseID',    sql.Int, 18)
-        .query(`
-          SELECT IdWhseStk, fAverageCost
-          FROM WhseStk
-          WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
-        `);
+          // Sync to Supabase sage_stock_balances
+          try {
+            await supabase.rpc('set_sage_stock_balance', {
+              p_sage_code: sageCode,
+              p_warehouse_id: 18,
+              p_quantity: newQty
+            });
+            console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${newQty}kg`);
+          } catch (supabaseError) {
+            console.warn(`  ⚠️  Failed to sync to Supabase sage_stock_balances: ${supabaseError.message}`);
+          }
 
-      if (whseResult.recordset.length > 0) {
-        await pool.request()
-          .input('StockLink', sql.Int,   stockLink)
-          .input('WhseID',    sql.Int,   18)
-          .input('NewCost',   sql.Float, cost)
-          .query(`
-            UPDATE WhseStk
-            SET fAverageCost = @NewCost
-            WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
-          `);
-        console.log(`  ✅ Average cost updated: ${sageCode} → $${cost}/kg (WhseStk)`);
-      } else {
-        // No WhseStk row — skip cost update, stock qty already correct in _etblStockQtys
-        console.log(`  ℹ️  No WhseStk row for ${sageCode} WhseID=18 — fAverageCost not set (non-critical)`);
-      }
+          // Update average cost
+          const whseResult = await pool.request()
+            .input('StockLink', sql.Int, stockLink)
+            .input('WhseID',    sql.Int, 18)
+            .query(`
+              SELECT IdWhseStk, fAverageCost
+              FROM WhseStk
+              WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
+            `);
+
+          if (whseResult.recordset.length > 0) {
+            await pool.request()
+              .input('StockLink', sql.Int,   stockLink)
+              .input('WhseID',    sql.Int,   18)
+              .input('NewCost',   sql.Float, cost)
+              .query(`
+                UPDATE WhseStk
+                SET fAverageCost = @NewCost
+                WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
+              `);
+            console.log(`  ✅ Average cost updated: ${sageCode} → $${cost}/kg (WhseStk)`);
+          } else {
+            console.log(`  ℹ️  No WhseStk row for ${sageCode} WhseID=18 — fAverageCost not set (non-critical)`);
+          }
+        }
+      );
     }
 
   } finally {
     // Close ONCE after all operations complete
-    await sql.close();
+    if (pool) await sql.close();
     console.log(`  Connection closed.`);
   }
 }

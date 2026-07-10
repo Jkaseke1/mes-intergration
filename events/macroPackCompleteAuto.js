@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
+const { postInventoryTransaction } = require('./lib/sagePost');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 
@@ -162,45 +163,18 @@ async function handleMacroPackComplete(syncEvent) {
       await safeWrite(
         `Issue ${qtyKg.toFixed(4)}kg of ${sageCode} for macropack ${macroCode}`,
         async () => {
-          await pool.request()
-            .input('iInvJrBatchID', sql.Int,      2)
-            .input('iStockID',      sql.Int,      stockLink)
-            .input('iWarehouseID',  sql.Int,      18)
-            .input('dTrDate',       sql.DateTime, trDate)
-            .input('iTrCodeID',     sql.Int,      31)
-            .input('iGLContraID',   sql.Int,      0)
-            .input('cReference',    sql.VarChar,  reference)
-            .input('cDescription',  sql.VarChar,  description)
-            .input('fQtyIn',        sql.Float,    0)
-            .input('fQtyOut',       sql.Float,    qtyKg)
-            .input('fNewCost',      sql.Float,    costMap[sageCode] || 0)
-            .input('bIsLotItem',    sql.Bit,      0)
-            .input('bIsSerialItem', sql.Bit,      0)
-            .query(`
-              INSERT INTO _etblInvJrBatchLines (
-                iInvJrBatchID, iStockID, iWarehouseID,
-                dTrDate, iTrCodeID, iGLContraID,
-                cReference, cDescription,
-                fQtyIn, fQtyOut, fNewCost,
-                bIsLotItem, bIsSerialItem
-              ) VALUES (
-                @iInvJrBatchID, @iStockID, @iWarehouseID,
-                @dTrDate, @iTrCodeID, @iGLContraID,
-                @cReference, @cDescription,
-                @fQtyIn, @fQtyOut, @fNewCost,
-                @bIsLotItem, @bIsSerialItem
-              )
-            `);
+          await postInventoryTransaction(pool, {
+            sageCode,
+            transactionType: 'macropack',
+            quantity: -qtyKg,
+            whseId: 18,
+            unitCost: costMap[sageCode] || 0,
+            reference,
+            description,
+            transactionDate: trDate
+          });
 
-          await pool.request()
-            .input('StockID', sql.Int,   stockLink)
-            .input('WhseID',  sql.Int,   18)
-            .input('QtyOut',  sql.Float, qtyKg)
-            .query(`
-              UPDATE _etblStockQtys 
-              SET QtyOnHand = QtyOnHand - @QtyOut 
-              WHERE StockID = @StockID AND WhseID = @WhseID
-            `);
+          console.log(`  ✅ Sage posted: ${sageCode} -${qtyKg.toFixed(4)}kg from WhseID 18`);
         }
       );
     }
@@ -223,64 +197,18 @@ async function handleMacroPackComplete(syncEvent) {
         await safeWrite(
           `Receipt ${wipUnits} units of ${macroCode} into Production warehouse`,
           async () => {
-            await pool.request()
-              .input('iInvJrBatchID', sql.Int,      2)
-              .input('iStockID',      sql.Int,      wipStockLink)
-              .input('iWarehouseID',  sql.Int,      19)
-              .input('dTrDate',       sql.DateTime, trDate)
-              .input('iTrCodeID',     sql.Int,      31)
-              .input('iGLContraID',   sql.Int,      0)
-              .input('cReference',    sql.VarChar,  wipRef)
-              .input('cDescription',  sql.VarChar,  wipDesc)
-              .input('fQtyIn',        sql.Float,    wipUnits)
-              .input('fQtyOut',       sql.Float,    0)
-              .input('fNewCost',      sql.Float,    costPerUnit)
-              .input('bIsLotItem',    sql.Bit,      0)
-              .input('bIsSerialItem', sql.Bit,      0)
-              .query(`
-                INSERT INTO _etblInvJrBatchLines (
-                  iInvJrBatchID, iStockID, iWarehouseID,
-                  dTrDate, iTrCodeID, iGLContraID,
-                  cReference, cDescription,
-                  fQtyIn, fQtyOut, fNewCost,
-                  bIsLotItem, bIsSerialItem
-                ) VALUES (
-                  @iInvJrBatchID, @iStockID, @iWarehouseID,
-                  @dTrDate, @iTrCodeID, @iGLContraID,
-                  @cReference, @cDescription,
-                  @fQtyIn, @fQtyOut, @fNewCost,
-                  @bIsLotItem, @bIsSerialItem
-                )
-              `);
+            await postInventoryTransaction(pool, {
+              sageCode: bom.macropack_code,
+              transactionType: 'macropack',
+              quantity: wipUnits,
+              whseId: 19,
+              unitCost: costPerUnit,
+              reference: wipRef,
+              description: wipDesc,
+              transactionDate: trDate
+            });
 
-            const existing = await pool.request()
-              .input('StockID', sql.Int, wipStockLink)
-              .input('WhseID',  sql.Int, 19)
-              .query(`
-                SELECT idStockQtys FROM _etblStockQtys 
-                WHERE StockID = @StockID AND WhseID = @WhseID
-              `);
-
-            if (existing.recordset.length > 0) {
-              await pool.request()
-                .input('StockID', sql.Int,   wipStockLink)
-                .input('WhseID',  sql.Int,   19)
-                .input('QtyIn',   sql.Float, wipUnits)
-                .query(`
-                  UPDATE _etblStockQtys 
-                  SET QtyOnHand = QtyOnHand + @QtyIn 
-                  WHERE StockID = @StockID AND WhseID = @WhseID
-                `);
-            } else {
-              await pool.request()
-                .input('StockID', sql.Int,   wipStockLink)
-                .input('WhseID',  sql.Int,   19)
-                .input('QtyIn',   sql.Float, wipUnits)
-                .query(`
-                  INSERT INTO _etblStockQtys (StockID, WhseID, QtyOnHand) 
-                  VALUES (@StockID, @WhseID, @QtyIn)
-                `);
-            }
+            console.log(`  ✅ Sage posted: ${bom.macropack_code} +${wipUnits} units into WhseID 19`);
           }
         );
       } else {

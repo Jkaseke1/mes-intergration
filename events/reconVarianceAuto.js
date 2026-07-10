@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
+const { postInventoryTransaction } = require('./lib/sagePost');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 
@@ -132,58 +133,18 @@ async function handleReconVariance(syncEvent) {
       await safeWrite(
         `Recon adjustment ${sageCode} ${isPositive ? '+' : '-'}${absQty.toFixed(2)}kg`,
         async () => {
-          await pool.request()
-            .input('iInvJrBatchID', sql.Int,      2)
-            .input('iStockID',      sql.Int,      stockLink)
-            .input('iWarehouseID',  sql.Int,      18)
-            .input('dTrDate',       sql.DateTime, new Date())
-            .input('iTrCodeID',     sql.Int,      32) // Adjustment
-            .input('iGLContraID',   sql.Int,      0)
-            .input('cReference',    sql.VarChar,  reference)
-            .input('cDescription',  sql.VarChar,  description)
-            .input('fQtyIn',        sql.Float,    isPositive ? absQty : 0)
-            .input('fQtyOut',       sql.Float,    isPositive ? 0 : absQty)
-            .input('fNewCost',      sql.Float,    0)
-            .input('bIsLotItem',    sql.Bit,      0)
-            .input('bIsSerialItem', sql.Bit,      0)
-            .query(`
-              INSERT INTO _etblInvJrBatchLines (
-                iInvJrBatchID, iStockID, iWarehouseID,
-                dTrDate, iTrCodeID, iGLContraID,
-                cReference, cDescription,
-                fQtyIn, fQtyOut, fNewCost,
-                bIsLotItem, bIsSerialItem
-              ) VALUES (
-                @iInvJrBatchID, @iStockID, @iWarehouseID,
-                @dTrDate, @iTrCodeID, @iGLContraID,
-                @cReference, @cDescription,
-                @fQtyIn, @fQtyOut, @fNewCost,
-                @bIsLotItem, @bIsSerialItem
-              )
-            `);
+          await postInventoryTransaction(pool, {
+            sageCode,
+            transactionType: 'recon',
+            quantity: isPositive ? absQty : -absQty,
+            whseId: 18,
+            unitCost: 0,
+            reference,
+            description,
+            transactionDate: new Date()
+          });
 
-          // Update stock qty
-          if (isPositive) {
-            await pool.request()
-              .input('StockID', sql.Int,   stockLink)
-              .input('WhseID',  sql.Int,   18)
-              .input('QtyIn',   sql.Float, absQty)
-              .query(`
-                UPDATE _etblStockQtys 
-                SET QtyOnHand = QtyOnHand + @QtyIn 
-                WHERE StockID = @StockID AND WhseID = @WhseID
-              `);
-          } else {
-            await pool.request()
-              .input('StockID', sql.Int,   stockLink)
-              .input('WhseID',  sql.Int,   18)
-              .input('QtyOut',  sql.Float, absQty)
-              .query(`
-                UPDATE _etblStockQtys 
-                SET QtyOnHand = QtyOnHand - @QtyOut 
-                WHERE StockID = @StockID AND WhseID = @WhseID
-              `);
-          }
+          console.log(`  ✅ Sage posted: ${sageCode} ${isPositive ? '+' : '-'}${absQty.toFixed(2)}kg in WhseID 18`);
         }
       );
     }

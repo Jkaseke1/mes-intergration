@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
+const { postInventoryTransaction } = require('./lib/sagePost');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 
@@ -119,53 +120,36 @@ async function handleBatchComplete(syncEvent) {
     await safeWrite(
       `FG receipt: ${netQty}kg of ${sageCode} into Despatch Warehouse`,
       async () => {
-        await pool.request()
-          .input('iInvJrBatchID', sql.Int,      1)
-          .input('iStockID',      sql.Int,      stockLink)
-          .input('iWarehouseID',  sql.Int,      20)
-          .input('dTrDate',       sql.DateTime, new Date())
-          .input('iTrCodeID',     sql.Int,      31)
-          .input('iGLContraID',   sql.Int,      0)
-          .input('cReference',    sql.VarChar,  reference)
-          .input('cDescription',  sql.VarChar,  description)
-          .input('fQtyIn',        sql.Float,    netQty)
-          .input('fQtyOut',       sql.Float,    0)
-          .input('fNewCost',      sql.Float,    costPerUnit)
-          .input('bIsLotItem',    sql.Bit,      0)
-          .input('bIsSerialItem', sql.Bit,      0)
-          .query(`
-            INSERT INTO _etblInvJrBatchLines (
-              iInvJrBatchID, iStockID, iWarehouseID,
-              dTrDate, iTrCodeID, iGLContraID,
-              cReference, cDescription,
-              fQtyIn, fQtyOut, fNewCost,
-              bIsLotItem, bIsSerialItem
-            ) VALUES (
-              @iInvJrBatchID, @iStockID, @iWarehouseID,
-              @dTrDate, @iTrCodeID, @iGLContraID,
-              @cReference, @cDescription,
-              @fQtyIn, @fQtyOut, @fNewCost,
-              @bIsLotItem, @bIsSerialItem
-            )
-          `);
+        await postInventoryTransaction(pool, {
+          sageCode,
+          transactionType: 'production',
+          quantity: netQty,
+          whseId: 20,
+          unitCost: costPerUnit,
+          reference,
+          description,
+          transactionDate: new Date()
+        });
 
-        const existing = await pool.request()
-          .input('StockID', sql.Int, stockLink)
-          .input('WhseID',  sql.Int, 20)
-          .query(`SELECT idStockQtys FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
+        console.log(`  ✅ Sage posted: ${sageCode} +${netQty}kg into WhseID 20`);
 
-        if (existing.recordset.length > 0) {
-          await pool.request()
-            .input('StockID', sql.Int,   stockLink)
-            .input('WhseID',  sql.Int,   20)
-            .input('QtyIn',   sql.Float, netQty)
-            .query(`UPDATE _etblStockQtys SET QtyOnHand = QtyOnHand + @QtyIn WHERE StockID = @StockID AND WhseID = @WhseID`);
-        } else {
-          await pool.request()
-            .input('StockID', sql.Int,   stockLink)
-            .input('WhseID',  sql.Int,   20)
-            .input('QtyIn',   sql.Float, netQty)
-            .query(`INSERT INTO _etblStockQtys (StockID, WhseID, QtyOnHand) VALUES (@StockID, @WhseID, @QtyIn)`);
+        // Sync to Supabase sage_stock_balances
+        try {
+          const existing = await pool.request()
+            .input('StockID', sql.Int, stockLink)
+            .input('WhseID',  sql.Int, 20)
+            .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
+
+          const newQty = existing.recordset.length > 0 ? existing.recordset[0].QtyOnHand : netQty;
+
+          await supabase.rpc('set_sage_stock_balance', {
+            p_sage_code: sageCode,
+            p_warehouse_id: 20,
+            p_quantity: newQty
+          });
+          console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${newQty}kg`);
+        } catch (supabaseError) {
+          console.warn(`  ⚠️  Failed to sync to Supabase sage_stock_balances: ${supabaseError.message}`);
         }
       }
     );

@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
+const { postInventoryTransaction } = require('./lib/sagePost');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 
@@ -128,104 +129,35 @@ async function handleDispatch(syncEvent) {
       await safeWrite(
         `Dispatch ${qty}kg of ${sageCode} to ${dispatch.branches?.name}`,
         async () => {
-          // Issue from DSP
-          const dspIssueResult = await pool.request()
-            .input('iInvJrBatchID', sql.Int,      1)
-            .input('iStockID',      sql.Int,      stockLink)
-            .input('iWarehouseID',  sql.Int,      20)
-            .input('dTrDate',       sql.DateTime, new Date(dispatch.dispatch_date))
-            .input('iTrCodeID',     sql.Int,      31)
-            .input('iGLContraID',   sql.Int,      0)
-            .input('cReference',    sql.VarChar,  reference)
-            .input('cDescription',  sql.VarChar,  descOut)
-            .input('fQtyIn',        sql.Float,    0)
-            .input('fQtyOut',       sql.Float,    qty)
-            .input('fNewCost',      sql.Float,    Number(item.unit_price || 0))
-            .input('iProjectID',    sql.Int,      0)
-            .input('iJobID',        sql.Int,      0)
-            .input('bIsLotItem',    sql.Bit,      0)
-            .input('bIsSerialItem', sql.Bit,      0)
-            .query(`
-              INSERT INTO _etblInvJrBatchLines (
-                iInvJrBatchID, iStockID, iWarehouseID,
-                dTrDate, iTrCodeID, iGLContraID,
-                cReference, cDescription,
-                fQtyIn, fQtyOut, fNewCost,
-                iProjectID, iJobID,
-                bIsLotItem, bIsSerialItem
-              ) OUTPUT INSERTED.idInvJrBatchLines
-              VALUES (
-                @iInvJrBatchID, @iStockID, @iWarehouseID,
-                @dTrDate, @iTrCodeID, @iGLContraID,
-                @cReference, @cDescription,
-                @fQtyIn, @fQtyOut, @fNewCost,
-                @iProjectID, @iJobID,
-                @bIsLotItem, @bIsSerialItem
-              )
-            `);
+          // Post DSP issue (negative qty)
+          await postInventoryTransaction(pool, {
+            sageCode,
+            transactionType: 'dispatch',
+            quantity: -qty,
+            whseId: 20,
+            unitCost: Number(item.unit_price || 0),
+            reference,
+            reference2: dispatch.branches?.name || '',
+            description: descOut,
+            transactionDate: new Date(dispatch.dispatch_date)
+          });
 
-          await pool.request()
-            .input('StockID', sql.Int,   stockLink)
-            .input('WhseID',  sql.Int,   20)
-            .input('QtyOut',  sql.Float, qty)
-            .query(`UPDATE _etblStockQtys SET QtyOnHand = QtyOnHand - @QtyOut WHERE StockID = @StockID AND WhseID = @WhseID`);
+          console.log(`  ✅ Sage posted: ${sageCode} -${qty}kg from WhseID 20 (DSP)`);
 
-          // Receive into branch
-          const branchReceiptResult = await pool.request()
-            .input('iInvJrBatchID', sql.Int,      1)
-            .input('iStockID',      sql.Int,      stockLink)
-            .input('iWarehouseID',  sql.Int,      destWhseLink)
-            .input('dTrDate',       sql.DateTime, new Date(dispatch.dispatch_date))
-            .input('iTrCodeID',     sql.Int,      31)
-            .input('iGLContraID',   sql.Int,      0)
-            .input('cReference',    sql.VarChar,  reference)
-            .input('cDescription',  sql.VarChar,  descIn)
-            .input('fQtyIn',        sql.Float,    qty)
-            .input('fQtyOut',       sql.Float,    0)
-            .input('fNewCost',      sql.Float,    Number(item.unit_price || 0))
-            .input('iProjectID',    sql.Int,      0)
-            .input('iJobID',        sql.Int,      0)
-            .input('bIsLotItem',    sql.Bit,      0)
-            .input('bIsSerialItem', sql.Bit,      0)
-            .query(`
-              INSERT INTO _etblInvJrBatchLines (
-                iInvJrBatchID, iStockID, iWarehouseID,
-                dTrDate, iTrCodeID, iGLContraID,
-                cReference, cDescription,
-                fQtyIn, fQtyOut, fNewCost,
-                iProjectID, iJobID,
-                bIsLotItem, bIsSerialItem
-              ) OUTPUT INSERTED.idInvJrBatchLines
-              VALUES (
-                @iInvJrBatchID, @iStockID, @iWarehouseID,
-                @dTrDate, @iTrCodeID, @iGLContraID,
-                @cReference, @cDescription,
-                @fQtyIn, @fQtyOut, @fNewCost,
-                @iProjectID, @iJobID,
-                @bIsLotItem, @bIsSerialItem
-              )
-            `);
+          // Post branch receipt (positive qty)
+          await postInventoryTransaction(pool, {
+            sageCode,
+            transactionType: 'dispatch',
+            quantity: qty,
+            whseId: destWhseLink,
+            unitCost: Number(item.unit_price || 0),
+            reference,
+            reference2: dispatch.branches?.name || '',
+            description: descIn,
+            transactionDate: new Date(dispatch.dispatch_date)
+          });
 
-          console.log(`  📌 DSP issue idInvJrBatchLines = ${dspIssueResult.recordset?.[0]?.idInvJrBatchLines}, branch receipt idInvJrBatchLines = ${branchReceiptResult.recordset?.[0]?.idInvJrBatchLines}`);
-
-          const branchQty = await pool.request()
-            .input('StockID', sql.Int, stockLink)
-            .input('WhseID',  sql.Int, destWhseLink)
-            .query(`SELECT idStockQtys FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
-
-          if (branchQty.recordset.length > 0) {
-            await pool.request()
-              .input('StockID', sql.Int,   stockLink)
-              .input('WhseID',  sql.Int,   destWhseLink)
-              .input('QtyIn',   sql.Float, qty)
-              .query(`UPDATE _etblStockQtys SET QtyOnHand = QtyOnHand + @QtyIn WHERE StockID = @StockID AND WhseID = @WhseID`);
-          } else {
-            await pool.request()
-              .input('StockID', sql.Int,   stockLink)
-              .input('WhseID',  sql.Int,   destWhseLink)
-              .input('QtyIn',   sql.Float, qty)
-              .query(`INSERT INTO _etblStockQtys (StockID, WhseID, QtyOnHand) VALUES (@StockID, @WhseID, @QtyIn)`);
-          }
+          console.log(`  ✅ Sage posted: ${sageCode} +${qty}kg into WhseID ${destWhseLink} (${dispatch.branches?.name})`);
         }
       );
     }
