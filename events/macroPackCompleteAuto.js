@@ -2,9 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
-const { postInventoryTransaction } = require('./lib/sagePost');
-
-const DRY_RUN = process.env.DRY_RUN === 'true';
+const { saveForReview } = require('./lib/reviewQueue');
 
 const sageConfig = {
   server:   'localhost',
@@ -24,23 +22,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function safeWrite(description, sqlFn) {
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would execute: ${description}`);
-    return { dryRun: true };
-  }
-  try {
-    const result = await sqlFn();
-    console.log(`[LIVE] ✅ Executed: ${description}`);
-    return result;
-  } catch (err) {
-    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
-    throw err;
-  }
-}
-
 async function handleMacroPackComplete(syncEvent) {
-  console.log('\n  → Event 7: Macropack Manufactured (Auto)');
+  console.log('\n  → Event 7: Macropack Manufactured (Auto) — Review Queue Mode');
 
   const orderId = syncEvent.reference_id;
   console.log(`  Order ID: ${orderId}`);
@@ -97,7 +80,7 @@ async function handleMacroPackComplete(syncEvent) {
     console.log(`  RM: ${rm?.sage_code} — dispensed ${issue.actual_grams_dispensed}g`);
   }
 
-  const costMap = {}; // sageCode -> fAverageCost from Sage
+  const costMap = {};
   let totalCostUSD = 0;
   let costPerUnit = 0;
 
@@ -107,7 +90,7 @@ async function handleMacroPackComplete(syncEvent) {
     const trDate = new Date(order.manufacture_date || new Date());
     const macroCode = bom?.macropack_code || 'MP';
 
-    // Fetch average costs from Sage for each ingredient
+    // Fetch average costs from Sage for each ingredient (read-only)
     for (const issue of issues) {
       const sageCode = issue.raw_materials?.sage_code;
       if (!sageCode) continue;
@@ -129,7 +112,7 @@ async function handleMacroPackComplete(syncEvent) {
     costPerUnit = actualUnits > 0 ? totalCostUSD / actualUnits : 0;
     console.log(`  Total ingredient cost: $${totalCostUSD.toFixed(4)} / ${actualUnits} units = $${costPerUnit.toFixed(4)}/unit`);
 
-    // Step 1: Issue each ingredient from RM warehouse (WhseID 18)
+    // Step 1: Issue each ingredient from RM warehouse (WhseID 18) — save for review
     for (const issue of issues) {
       const sageCode = issue.raw_materials?.sage_code;
       const rmName   = issue.raw_materials?.name;
@@ -139,7 +122,7 @@ async function handleMacroPackComplete(syncEvent) {
         continue;
       }
 
-      const qtyKg = Number(issue.actual_grams_dispensed || 0) / 1000; // grams to kg
+      const qtyKg = Number(issue.actual_grams_dispensed || 0) / 1000;
       if (qtyKg <= 0) {
         console.log(`  ⚠️  Zero qty for ${sageCode} — skipping`);
         continue;
@@ -154,32 +137,24 @@ async function handleMacroPackComplete(syncEvent) {
         continue;
       }
 
-      const stockLink   = stockResult.recordset[0].StockLink;
       const reference   = `MP-${macroCode}`.substring(0, 20);
       const description = `Macropack issue ${rmName || sageCode}`.substring(0, 40);
 
-      console.log(`  Issuing: ${sageCode} — ${qtyKg.toFixed(4)}kg from WhseID 18`);
+      console.log(`  Preparing issue: ${sageCode} — ${qtyKg.toFixed(4)}kg from WhseID 18`);
 
-      await safeWrite(
-        `Issue ${qtyKg.toFixed(4)}kg of ${sageCode} for macropack ${macroCode}`,
-        async () => {
-          await postInventoryTransaction(pool, {
-            sageCode,
-            transactionType: 'macropack',
-            quantity: -qtyKg,
-            whseId: 18,
-            unitCost: costMap[sageCode] || 0,
-            reference,
-            description,
-            transactionDate: trDate
-          });
-
-          console.log(`  ✅ Sage posted: ${sageCode} -${qtyKg.toFixed(4)}kg from WhseID 18`);
-        }
-      );
+      await saveForReview(syncEvent.id, 'macropack_completed', `Macropack issue ${sageCode} for ${macroCode}`, {
+        sageCode,
+        transactionType: 'macropack',
+        quantity: -qtyKg,
+        whseId: 18,
+        unitCost: costMap[sageCode] || 0,
+        reference,
+        description,
+        transactionDate: trDate,
+      });
     }
 
-    // Step 2: Receipt of macropack WIP into Production warehouse (WhseID 19)
+    // Step 2: Receipt of macropack WIP into Production warehouse (WhseID 19) — save for review
     const wipUnits = Number(order.actual_units || order.planned_units || 0);
 
     if (wipUnits > 0 && bom?.macropack_code) {
@@ -188,29 +163,21 @@ async function handleMacroPackComplete(syncEvent) {
         .query(`SELECT StockLink FROM StkItem WHERE Code = @Code AND ItemActive = 1`);
 
       if (wipStockResult.recordset.length > 0) {
-        const wipStockLink = wipStockResult.recordset[0].StockLink;
-        const wipRef       = `MP-${macroCode}`.substring(0, 20);
-        const wipDesc      = `Macropack WIP ${bom.macropack_name}`.substring(0, 40);
+        const wipRef  = `MP-${macroCode}`.substring(0, 20);
+        const wipDesc = `Macropack WIP ${bom.macropack_name}`.substring(0, 40);
 
-        console.log(`  Receipt: ${wipUnits} units of ${macroCode} into WhseID 19`);
+        console.log(`  Preparing receipt: ${wipUnits} units of ${macroCode} into WhseID 19`);
 
-        await safeWrite(
-          `Receipt ${wipUnits} units of ${macroCode} into Production warehouse`,
-          async () => {
-            await postInventoryTransaction(pool, {
-              sageCode: bom.macropack_code,
-              transactionType: 'macropack',
-              quantity: wipUnits,
-              whseId: 19,
-              unitCost: costPerUnit,
-              reference: wipRef,
-              description: wipDesc,
-              transactionDate: trDate
-            });
-
-            console.log(`  ✅ Sage posted: ${bom.macropack_code} +${wipUnits} units into WhseID 19`);
-          }
-        );
+        await saveForReview(syncEvent.id, 'macropack_completed', `Macropack WIP receipt ${macroCode}`, {
+          sageCode: bom.macropack_code,
+          transactionType: 'macropack',
+          quantity: wipUnits,
+          whseId: 19,
+          unitCost: costPerUnit,
+          reference: wipRef,
+          description: wipDesc,
+          transactionDate: trDate,
+        });
       } else {
         console.log(`  ⚠️  Macropack ${macroCode} not found in Sage StkItem — skipping WIP receipt`);
       }

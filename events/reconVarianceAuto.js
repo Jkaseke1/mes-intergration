@@ -2,9 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
-const { postInventoryTransaction } = require('./lib/sagePost');
-
-const DRY_RUN = process.env.DRY_RUN === 'true';
+const { saveForReview } = require('./lib/reviewQueue');
 
 const sageConfig = {
   server:   'localhost',
@@ -24,29 +22,13 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function safeWrite(description, sqlFn) {
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would execute: ${description}`);
-    return { dryRun: true };
-  }
-  try {
-    const result = await sqlFn();
-    console.log(`[LIVE] ✅ Executed: ${description}`);
-    return result;
-  } catch (err) {
-    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
-    throw err;
-  }
-}
-
 async function handleReconVariance(syncEvent) {
-  console.log('\n  → Event 8: Reconciliation Variance Adjustment (Auto)');
+  console.log('\n  → Event 8: Reconciliation Variance Adjustment (Auto) — Review Queue Mode');
 
   const reconId = syncEvent.reference_id;
   console.log(`  Reference ID: ${reconId}`);
 
   // Read all approved reconciliation lines with non-zero variance
-  // reference_id could be a single row ID or we query by period
   const { data: lines, error: linesError } = await supabase
     .from('monthly_rm_reconciliation')
     .select('id, material_id, material_name, variance_kg, variance_reason_code, variance_comment, period_start, period_end, reconciliation_status')
@@ -58,10 +40,9 @@ async function handleReconVariance(syncEvent) {
     throw new Error(`Reconciliation query error: ${linesError.message}`);
   }
 
-  // Filter to lines matching the reference period if reference_id is a reconciliation row ID
+  // Filter to lines matching the reference period
   let targetLines = lines || [];
 
-  // Try to find by specific ID first
   const { data: singleLine } = await supabase
     .from('monthly_rm_reconciliation')
     .select('period_start, period_end')
@@ -69,7 +50,6 @@ async function handleReconVariance(syncEvent) {
     .single();
 
   if (singleLine) {
-    // Filter to same period
     targetLines = targetLines.filter(l =>
       l.period_start === singleLine.period_start && l.period_end === singleLine.period_end
     );
@@ -119,8 +99,7 @@ async function handleReconVariance(syncEvent) {
         continue;
       }
 
-      const stockLink = stockResult.recordset[0].StockLink;
-      const isPositive = varianceKg > 0; // physical > system → stock in
+      const isPositive = varianceKg > 0;
       const absQty     = Math.abs(varianceKg);
 
       const reasonCode = (line.variance_reason_code || '').replace(/_/g, ' ');
@@ -128,25 +107,24 @@ async function handleReconVariance(syncEvent) {
       const reference  = `RECON-${line.period_start}`.substring(0, 20);
       const description = `${reasonCode} ${comment}`.trim().substring(0, 40) || `Recon adj ${sageCode}`;
 
-      console.log(`  Adjusting: ${sageCode} — ${isPositive ? '+' : '-'}${absQty.toFixed(2)}kg (${isPositive ? 'IN' : 'OUT'})`);
+      console.log(`  Preparing: ${sageCode} — ${isPositive ? '+' : '-'}${absQty.toFixed(2)}kg (${isPositive ? 'IN' : 'OUT'})`);
 
-      await safeWrite(
-        `Recon adjustment ${sageCode} ${isPositive ? '+' : '-'}${absQty.toFixed(2)}kg`,
-        async () => {
-          await postInventoryTransaction(pool, {
-            sageCode,
-            transactionType: 'recon',
-            quantity: isPositive ? absQty : -absQty,
-            whseId: 18,
-            unitCost: 0,
-            reference,
-            description,
-            transactionDate: new Date()
-          });
+      // Fetch AverageCost for the review display
+      const costResult = await pool.request()
+        .input('Code', sql.VarChar, sageCode)
+        .query(`SELECT TOP 1 AverageCost FROM _bvWarehouseStockFull WHERE Code = @Code`);
+      const avgCost = costResult.recordset[0]?.AverageCost || 0;
 
-          console.log(`  ✅ Sage posted: ${sageCode} ${isPositive ? '+' : '-'}${absQty.toFixed(2)}kg in WhseID 18`);
-        }
-      );
+      await saveForReview(syncEvent.id, 'reconciliation_variance_approved', `Recon adj ${sageCode} — ${reasonCode}`, {
+        sageCode,
+        transactionType: 'recon',
+        quantity: isPositive ? absQty : -absQty,
+        whseId: 18,
+        unitCost: avgCost,
+        reference,
+        description,
+        transactionDate: new Date(),
+      });
     }
   } finally {
     if (pool) await sql.close();
