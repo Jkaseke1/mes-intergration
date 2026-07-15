@@ -22,6 +22,10 @@ const GL_ACCOUNT_WIP = process.env.SAGE_GL_ACCOUNT_WIP || '';
 const GL_ACCOUNT_COGS = process.env.SAGE_GL_ACCOUNT_COGS || '';
 const GL_ACCOUNT_RECON = process.env.SAGE_GL_ACCOUNT_RECON || '2200-DEB-1120';
 
+// GRV-specific accounts (for PostGRVV2 with cost revaluation)
+const GRV_TRADE_PAYABLES = process.env.SAGE_GRV_TRADE_PAYABLES || '9000-GRA-9000';
+const GRV_VARIANCE_ACCOUNT = process.env.SAGE_GRV_VARIANCE_ACCOUNT || '2200-GRA-2230';
+
 const USERNAME = process.env.SAGE_POST_USERNAME || 'HYPER-MES';
 
 // Cache warehouse code lookups
@@ -92,6 +96,15 @@ async function postInventoryTransaction(pool, {
       throw new Error(`Unknown transaction type: ${transactionType}`);
   }
 
+  // Route GRN transactions through PostGRVV2 (with Trade Payables + cost revaluation)
+  if (transactionType === 'grn') {
+    return await postGRVTransaction(pool, {
+      sageCode, txCode, quantity, whCode, lotNumber,
+      unitCost, projectId, reference, reference2,
+      description, transactionDate,
+    });
+  }
+
   const result = await pool.request()
     .input('ItemCode', sql.VarChar, sageCode)
     .input('InventoryTransactionCode', sql.VarChar, txCode)
@@ -111,8 +124,36 @@ async function postInventoryTransaction(pool, {
   return result;
 }
 
+// GRV-specific posting with Trade Payables credit + cost revaluation
+// Matches pre-MES Sage GRV pattern: Debit Stock, Credit Trade Payables, + variance entries
+async function postGRVTransaction(pool, {
+  sageCode, txCode, quantity, whCode, lotNumber,
+  unitCost, projectId, reference, reference2,
+  description, transactionDate,
+}) {
+  const result = await pool.request()
+    .input('ItemCode', sql.VarChar, sageCode)
+    .input('InventoryTransactionCode', sql.VarChar, txCode)
+    .input('Quantity', sql.Float, quantity)
+    .input('WHCode', sql.VarChar, whCode)
+    .input('LotNumber', sql.VarChar, lotNumber || '')
+    .input('UnitCost', sql.Float, unitCost || 0)
+    .input('ProjectID', sql.Int, projectId || 0)
+    .input('TradePayablesAccountCode', sql.VarChar, GRV_TRADE_PAYABLES)
+    .input('VarianceAccountCode', sql.VarChar, GRV_VARIANCE_ACCOUNT)
+    .input('Reference', sql.VarChar, (reference || '').substring(0, 50))
+    .input('Reference2', sql.VarChar, (reference2 || '').substring(0, 50))
+    .input('TransactionDate', sql.DateTime, transactionDate || new Date())
+    .input('Description', sql.VarChar, (description || '').substring(0, 255))
+    .input('UserName', sql.VarChar, USERNAME)
+    .execute('PostGRVV2');
+
+  return result;
+}
+
 module.exports = {
   postInventoryTransaction,
+  postGRVTransaction,
   getWarehouseCode,
   getWarehouseLink,
 };

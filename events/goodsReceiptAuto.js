@@ -95,14 +95,15 @@ async function handleGoodsReceipt(syncEvent) {
       }
 
       const reference   = grn.grn_number.substring(0, 20);
-      const description = (rmName || sageCode).substring(0, 40);
-      const qty         = Number(item.received_qty);
-      const cost        = Number(item.unit_cost || 0);
+      const supplierName = supplier?.name || 'Unknown Supplier';
+      const description  = `${rmName || sageCode} — ${supplierName}`.substring(0, 255);
+      const qty          = Number(item.received_qty);
+      const cost         = Number(item.unit_cost || 0);
 
-      console.log(`  Preparing: ${sageCode} — ${qty}kg @ $${cost}`);
+      console.log(`  Preparing: ${sageCode} — ${qty}kg @ $${cost} (Supplier: ${supplierName})`);
 
       // Save to review queue instead of posting to Sage
-      await saveForReview(syncEvent.id, 'grn_confirmed', `GRN ${grn.grn_number} — ${rmName || sageCode}`, {
+      await saveForReview(syncEvent.id, 'grn_confirmed', `GRN ${grn.grn_number} — ${rmName || sageCode} (${supplierName})`, {
         sageCode,
         transactionType: 'grn',
         quantity: qty,
