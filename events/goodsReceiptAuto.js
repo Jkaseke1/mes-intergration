@@ -156,30 +156,8 @@ async function handleGoodsReceipt(syncEvent) {
             console.warn(`  ⚠️  Failed to sync to Supabase sage_stock_balances: ${supabaseError.message}`);
           }
 
-          // Update average cost
-          const whseResult = await pool.request()
-            .input('StockLink', sql.Int, stockLink)
-            .input('WhseID',    sql.Int, 18)
-            .query(`
-              SELECT IdWhseStk, fAverageCost
-              FROM WhseStk
-              WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
-            `);
-
-          if (whseResult.recordset.length > 0) {
-            await pool.request()
-              .input('StockLink', sql.Int,   stockLink)
-              .input('WhseID',    sql.Int,   18)
-              .input('NewCost',   sql.Float, cost)
-              .query(`
-                UPDATE WhseStk
-                SET fAverageCost = @NewCost
-                WHERE WHStockLink = @StockLink AND WHWhseID = @WhseID
-              `);
-            console.log(`  ✅ Average cost updated: ${sageCode} → $${cost}/kg (WhseStk)`);
-          } else {
-            console.log(`  ℹ️  No WhseStk row for ${sageCode} WhseID=18 — fAverageCost not set (non-critical)`);
-          }
+          // Note: Do NOT overwrite fAverageCost — Sage's PostInventoryTxV2 handles weighted average calculation internally
+          console.log(`  ℹ️  Sage handles weighted average cost internally (no manual overwrite)`);
         }
       );
     }

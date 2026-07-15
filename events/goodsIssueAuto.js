@@ -92,6 +92,13 @@ async function handleGoodsIssue(syncEvent) {
     const reference   = `WO-${batchNumber}`.substring(0, 20);
     const description = `Issue to ${batchNumber}`.substring(0, 40);
 
+    // Fetch live AverageCost from Sage (pre-MES logic: MFDR uses moving average cost, not form cost)
+    const costResult = await pool.request()
+      .input('Code', sql.VarChar, sageCode)
+      .query(`SELECT TOP 1 AverageCost FROM _bvWarehouseStockFull WHERE Code = @Code`);
+    const avgCost = costResult.recordset[0]?.AverageCost || 0;
+    console.log(`  Sage AverageCost: ${sageCode} = $${avgCost.toFixed(4)}/kg`);
+
     // Check current stock before issuing
     const stockCheck = await pool.request()
       .input('StockID', sql.Int, stockLink)
@@ -112,7 +119,7 @@ async function handleGoodsIssue(syncEvent) {
           transactionType: 'issue',
           quantity: -actualQty,
           whseId: 18,
-          unitCost: Number(material.unit_cost || 0),
+          unitCost: avgCost,
           reference,
           description,
           transactionDate: new Date()
