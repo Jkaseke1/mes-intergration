@@ -2,9 +2,8 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
-const { postInventoryTransaction } = require('./lib/sagePost');
+const { saveForReview } = require('./lib/reviewQueue');
 
-const DRY_RUN = process.env.DRY_RUN === 'true';
 const FG_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_WAREHOUSE_ID, 10) || 19;
 const FG_TRANSFER_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_TRANSFER_WAREHOUSE_ID, 10) || 17;
 
@@ -26,23 +25,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function safeWrite(description, sqlFn) {
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would execute: ${description}`);
-    return { dryRun: true };
-  }
-  try {
-    const result = await sqlFn();
-    console.log(`[LIVE] ✅ Executed: ${description}`);
-    return result;
-  } catch (err) {
-    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
-    throw err;
-  }
-}
-
 async function handleBatchComplete(syncEvent) {
-  console.log('\n  → Event 3: Batch Complete (Auto)');
+  console.log('\n  → Event 3: Batch Complete (Auto) — Review Queue Mode');
 
   const orderId = syncEvent.reference_id;
 
@@ -76,12 +60,13 @@ async function handleBatchComplete(syncEvent) {
   // Cost calculated after Sage connection using live fAverageCost
   let totalMaterialCost = 0;
   let costPerUnit = 0;
+  let fgAvgCost = 0;
 
   let pool;
   try {
     pool = await sql.connect(sageConfig);
 
-    // Fetch live average costs from Sage WhseStk for each ingredient
+    // Fetch live average costs from Sage for each ingredient (reporting only)
     if (materials && materials.length > 0) {
       for (const mat of materials) {
         const matSageCode = mat.raw_materials?.sage_code;
@@ -115,13 +100,11 @@ async function handleBatchComplete(syncEvent) {
 
     if (stockResult.recordset.length === 0) throw new Error(`${sageCode} not found in Sage`);
 
-    const stockLink   = stockResult.recordset[0].StockLink;
-
-    // Fetch live AverageCost from Sage for FG (pre-MES logic: MFMF uses moving average cost, not calculated RM cost)
+    // Fetch live AverageCost from Sage for FG (pre-MES logic: MFMF uses moving average cost)
     const fgCostResult = await pool.request()
       .input('Code', sql.VarChar, sageCode)
       .query(`SELECT TOP 1 AverageCost FROM _bvWarehouseStockFull WHERE Code = @Code`);
-    const fgAvgCost = fgCostResult.recordset[0]?.AverageCost || 0;
+    fgAvgCost = fgCostResult.recordset[0]?.AverageCost || 0;
     console.log(`  Sage FG AverageCost: ${sageCode} = $${fgAvgCost.toFixed(4)}/kg (using this for MFMF + transfer)`);
 
     const reference   = `WO-${order.batch_number}`.substring(0, 20);
@@ -129,86 +112,44 @@ async function handleBatchComplete(syncEvent) {
 
     const doTransfer = FG_TRANSFER_WAREHOUSE_ID && FG_TRANSFER_WAREHOUSE_ID !== FG_WAREHOUSE_ID;
 
-    await safeWrite(
-      `FG receipt${doTransfer ? ' + transfer to DEB' : ''}: ${netQty}kg of ${sageCode} into WhseID ${FG_WAREHOUSE_ID}${doTransfer ? ` then ${FG_TRANSFER_WAREHOUSE_ID}` : ''}`,
-      async () => {
-        await postInventoryTransaction(pool, {
-          sageCode,
-          transactionType: 'production',
-          quantity: netQty,
-          whseId: FG_WAREHOUSE_ID,
-          unitCost: fgAvgCost,
-          reference,
-          description,
-          transactionDate: new Date()
-        });
+    // 1. FG Receipt (MFMF) — save for review
+    await saveForReview(syncEvent.id, 'production_completed', `MFMF ${sageCode} — ${order.formulations?.name}`, {
+      sageCode,
+      transactionType: 'production',
+      quantity: netQty,
+      whseId: FG_WAREHOUSE_ID,
+      unitCost: fgAvgCost,
+      reference,
+      description,
+      transactionDate: new Date(),
+    });
 
-        console.log(`  ✅ Sage posted: ${sageCode} +${netQty}kg into WhseID ${FG_WAREHOUSE_ID}`);
+    if (doTransfer) {
+      // 2. PD issue (WHT out) — save for review
+      await saveForReview(syncEvent.id, 'production_completed', `Transfer PD→DEB ${sageCode}`, {
+        sageCode,
+        transactionType: 'dispatch',
+        quantity: -netQty,
+        whseId: FG_WAREHOUSE_ID,
+        unitCost: fgAvgCost,
+        reference,
+        description: 'Transfer to DEB',
+        transactionDate: new Date(),
+      });
 
-        if (doTransfer) {
-          await postInventoryTransaction(pool, {
-            sageCode,
-            transactionType: 'dispatch',
-            quantity: -netQty,
-            whseId: FG_WAREHOUSE_ID,
-            unitCost: fgAvgCost,
-            reference,
-            description: 'Transfer to DEB',
-            transactionDate: new Date()
-          });
+      // 3. DEB receipt (WHT in) — save for review
+      await saveForReview(syncEvent.id, 'production_completed', `Transfer DEB receipt ${sageCode}`, {
+        sageCode,
+        transactionType: 'dispatch',
+        quantity: netQty,
+        whseId: FG_TRANSFER_WAREHOUSE_ID,
+        unitCost: fgAvgCost,
+        reference,
+        description: 'Transfer from PD',
+        transactionDate: new Date(),
+      });
+    }
 
-          await postInventoryTransaction(pool, {
-            sageCode,
-            transactionType: 'dispatch',
-            quantity: netQty,
-            whseId: FG_TRANSFER_WAREHOUSE_ID,
-            unitCost: fgAvgCost,
-            reference,
-            description: 'Transfer from PD',
-            transactionDate: new Date()
-          });
-
-          console.log(`  ✅ Transferred ${netQty}kg from WhseID ${FG_WAREHOUSE_ID} to WhseID ${FG_TRANSFER_WAREHOUSE_ID}`);
-        }
-
-        // Sync final balances to Supabase sage_stock_balances
-        try {
-          const finalWarehouseId = doTransfer ? FG_TRANSFER_WAREHOUSE_ID : FG_WAREHOUSE_ID;
-
-          const existing = await pool.request()
-            .input('StockID', sql.Int, stockLink)
-            .input('WhseID',  sql.Int, finalWarehouseId)
-            .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
-
-          const newQty = existing.recordset.length > 0 ? existing.recordset[0].QtyOnHand : netQty;
-
-          await supabase.rpc('set_sage_stock_balance', {
-            p_sage_code: sageCode,
-            p_warehouse_id: finalWarehouseId,
-            p_quantity: newQty
-          });
-          console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${newQty}kg in WhseID ${finalWarehouseId}`);
-
-          if (doTransfer) {
-            const pdExisting = await pool.request()
-              .input('StockID', sql.Int, stockLink)
-              .input('WhseID',  sql.Int, FG_WAREHOUSE_ID)
-              .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
-
-            const pdQty = pdExisting.recordset.length > 0 ? pdExisting.recordset[0].QtyOnHand : 0;
-
-            await supabase.rpc('set_sage_stock_balance', {
-              p_sage_code: sageCode,
-              p_warehouse_id: FG_WAREHOUSE_ID,
-              p_quantity: pdQty
-            });
-            console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${pdQty}kg in WhseID ${FG_WAREHOUSE_ID}`);
-          }
-        } catch (supabaseError) {
-          console.warn(`  ⚠️  Failed to sync to Supabase sage_stock_balances: ${supabaseError.message}`);
-        }
-      }
-    );
   } finally {
     if (pool) await sql.close();
   }

@@ -18,6 +18,7 @@ const { handleDispatch }      = require('./dispatchAuto');
 const { handleMacroPackComplete } = require('./macroPackCompleteAuto');
 const { handleReconVariance }     = require('./reconVarianceAuto');
 const { handleRMCostUpdate }      = require('./rmCostUpdateAuto');
+const { postApprovedReviews }     = require('./postApprovedReviews');
 
 async function processPendingEvents() {
   const { data: pending, error } = await supabase
@@ -113,16 +114,16 @@ async function processPendingEvents() {
           continue;
       }
 
-      // Mark as success
+      // Mark as pending_finance_review (handlers now save to review queue, not Sage)
       await supabase
         .from('sync_log')
         .update({
-          status:     'success',
+          status:     'pending_finance_review',
           updated_at: new Date().toISOString(),
         })
         .eq('id', event.id);
 
-      console.log(`  ✅ ${event.event_type} processed successfully`);
+      console.log(`  📋 ${event.event_type} prepared for finance review`);
 
     } catch (err) {
       console.error(`  ❌ Failed: ${err.message}`);
@@ -147,11 +148,17 @@ async function startWorker() {
   console.log(` Mode: ${DRY_RUN ? 'DRY RUN' : 'LIVE'}`);
   console.log(` Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
   console.log('==============================================\n');
-  console.log('Watching sync_log for pending events...');
-  console.log('Idempotency check: ENABLED — no duplicate processing\n');
+  console.log('Two-phase mode: PREPARE → FINANCE REVIEW → POST');
+  console.log('Phase 1: Preparing pending events for review');
+  console.log('Phase 2: Posting finance-approved reviews to Sage\n');
 
-  await processPendingEvents();
+  // Start both loops
   setInterval(processPendingEvents, POLL_INTERVAL_MS);
+  setInterval(postApprovedReviews, POLL_INTERVAL_MS);
+
+  // Run immediately
+  await processPendingEvents();
+  await postApprovedReviews();
 }
 
 startWorker();

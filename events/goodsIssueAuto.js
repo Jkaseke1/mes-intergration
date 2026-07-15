@@ -2,9 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
-const { postInventoryTransaction } = require('./lib/sagePost');
-
-const DRY_RUN = process.env.DRY_RUN === 'true';
+const { saveForReview } = require('./lib/reviewQueue');
 
 const sageConfig = {
   server:   'localhost',
@@ -24,23 +22,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function safeWrite(description, sqlFn) {
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would execute: ${description}`);
-    return { dryRun: true };
-  }
-  try {
-    const result = await sqlFn();
-    console.log(`[LIVE] ✅ Executed: ${description}`);
-    return result;
-  } catch (err) {
-    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
-    throw err;
-  }
-}
-
 async function handleGoodsIssue(syncEvent) {
-  console.log('\n  → Event 2: Goods Issue (Auto)');
+  console.log('\n  → Event 2: Goods Issue (Auto) — Review Queue Mode');
 
   const materialId = syncEvent.reference_id;
 
@@ -92,7 +75,7 @@ async function handleGoodsIssue(syncEvent) {
     const reference   = `WO-${batchNumber}`.substring(0, 20);
     const description = `Issue to ${batchNumber}`.substring(0, 40);
 
-    // Fetch live AverageCost from Sage (pre-MES logic: MFDR uses moving average cost, not form cost)
+    // Fetch live AverageCost from Sage (pre-MES logic: MFDR uses moving average cost)
     const costResult = await pool.request()
       .input('Code', sql.VarChar, sageCode)
       .query(`SELECT TOP 1 AverageCost FROM _bvWarehouseStockFull WHERE Code = @Code`);
@@ -111,36 +94,18 @@ async function handleGoodsIssue(syncEvent) {
       throw new Error(`Insufficient stock: ${sageCode} has ${currentStock}kg but ${actualQty}kg requested`);
     }
 
-    await safeWrite(
-      `Issue ${actualQty}kg of ${sageCode} for ${batchNumber}`,
-      async () => {
-        await postInventoryTransaction(pool, {
-          sageCode,
-          transactionType: 'issue',
-          quantity: -actualQty,
-          whseId: 18,
-          unitCost: avgCost,
-          reference,
-          description,
-          transactionDate: new Date()
-        });
+    // Save to review queue instead of posting to Sage
+    await saveForReview(syncEvent.id, 'materials_issued', `RM Issue ${sageCode} for ${batchNumber}`, {
+      sageCode,
+      transactionType: 'issue',
+      quantity: -actualQty,
+      whseId: 18,
+      unitCost: avgCost,
+      reference,
+      description,
+      transactionDate: new Date(),
+    });
 
-        console.log(`  ✅ Sage posted: ${sageCode} -${actualQty}kg from WhseID 18`);
-
-        // Sync to Supabase sage_stock_balances
-        try {
-          const newQty = currentStock - actualQty;
-          await supabase.rpc('set_sage_stock_balance', {
-            p_sage_code: sageCode,
-            p_warehouse_id: 18,
-            p_quantity: newQty
-          });
-          console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${newQty}kg`);
-        } catch (supabaseError) {
-          console.warn(`  ⚠️  Failed to sync to Supabase sage_stock_balances: ${supabaseError.message}`);
-        }
-      }
-    );
   } finally {
     if (pool) await sql.close();
   }

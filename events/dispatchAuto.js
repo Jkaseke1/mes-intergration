@@ -2,9 +2,9 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
-const { postInventoryTransaction, getWarehouseLink } = require('./lib/sagePost');
+const { saveForReview } = require('./lib/reviewQueue');
+const { getWarehouseLink } = require('./lib/sagePost');
 
-const DRY_RUN = process.env.DRY_RUN === 'true';
 const DISPATCH_SOURCE_WAREHOUSE_ID = parseInt(process.env.SAGE_DISPATCH_SOURCE_WAREHOUSE_ID, 10) || 17;
 
 const sageConfig = {
@@ -35,23 +35,8 @@ const BRANCH_WAREHOUSE_MAP = {
   'CHI000001': 39,
 };
 
-async function safeWrite(description, sqlFn) {
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would execute: ${description}`);
-    return { dryRun: true };
-  }
-  try {
-    const result = await sqlFn();
-    console.log(`[LIVE] ✅ Executed: ${description}`);
-    return result;
-  } catch (err) {
-    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
-    throw err;
-  }
-}
-
 async function handleDispatch(syncEvent) {
-  console.log('\n  → Event 4: Dispatch (Auto)');
+  console.log('\n  → Event 4: Dispatch (Auto) — Review Queue Mode');
 
   const dispatchId = syncEvent.reference_id;
 
@@ -124,7 +109,7 @@ async function handleDispatch(syncEvent) {
 
       const stockLink   = stockResult.recordset[0].StockLink;
 
-      // Fetch live AverageCost from Sage (pre-MES logic: WHT uses moving average cost, not selling price)
+      // Fetch live AverageCost from Sage (pre-MES logic: WHT uses moving average cost)
       const costResult = await pool.request()
         .input('Code', sql.VarChar, sageCode)
         .query(`SELECT TOP 1 AverageCost FROM _bvWarehouseStockFull WHERE Code = @Code`);
@@ -149,40 +134,31 @@ async function handleDispatch(syncEvent) {
         throw new Error(`Insufficient stock in source warehouse ${sourceWhseLink}: ${sageCode} has ${currentStock}kg but ${qty}kg requested`);
       }
 
-      await safeWrite(
-        `Dispatch ${qty}kg of ${sageCode} to ${dispatch.branches?.name}`,
-        async () => {
-          // Post source warehouse issue (negative qty)
-          await postInventoryTransaction(pool, {
-            sageCode,
-            transactionType: 'dispatch',
-            quantity: -qty,
-            whseId: sourceWhseLink,
-            unitCost: avgCost,
-            reference,
-            reference2: dispatch.branches?.name || '',
-            description: descOut,
-            transactionDate: new Date(dispatch.dispatch_date)
-          });
+      // 1. Source warehouse issue (WHT out) — save for review
+      await saveForReview(syncEvent.id, 'dispatch_delivered', `Dispatch OUT ${sageCode} → ${dispatch.branches?.name}`, {
+        sageCode,
+        transactionType: 'dispatch',
+        quantity: -qty,
+        whseId: sourceWhseLink,
+        unitCost: avgCost,
+        reference,
+        reference2: dispatch.branches?.name || '',
+        description: descOut,
+        transactionDate: new Date(dispatch.dispatch_date),
+      });
 
-          console.log(`  ✅ Sage posted: ${sageCode} -${qty}kg from WhseID ${sourceWhseLink}`);
-
-          // Post branch receipt (positive qty)
-          await postInventoryTransaction(pool, {
-            sageCode,
-            transactionType: 'dispatch',
-            quantity: qty,
-            whseId: destWhseLink,
-            unitCost: avgCost,
-            reference,
-            reference2: dispatch.branches?.name || '',
-            description: descIn,
-            transactionDate: new Date(dispatch.dispatch_date)
-          });
-
-          console.log(`  ✅ Sage posted: ${sageCode} +${qty}kg into WhseID ${destWhseLink} (${dispatch.branches?.name})`);
-        }
-      );
+      // 2. Branch receipt (WHT in) — save for review
+      await saveForReview(syncEvent.id, 'dispatch_delivered', `Dispatch IN ${sageCode} → ${dispatch.branches?.name}`, {
+        sageCode,
+        transactionType: 'dispatch',
+        quantity: qty,
+        whseId: destWhseLink,
+        unitCost: avgCost,
+        reference,
+        reference2: dispatch.branches?.name || '',
+        description: descIn,
+        transactionDate: new Date(dispatch.dispatch_date),
+      });
     }
   } finally {
     if (pool) await sql.close();

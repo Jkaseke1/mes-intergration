@@ -2,9 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
-const { postInventoryTransaction } = require('./lib/sagePost');
-
-const DRY_RUN = process.env.DRY_RUN === 'true';
+const { saveForReview } = require('./lib/reviewQueue');
 
 const sageConfig = {
   server:   'localhost',
@@ -24,23 +22,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-async function safeWrite(description, sqlFn) {
-  if (DRY_RUN) {
-    console.log(`[DRY RUN] Would execute: ${description}`);
-    return { dryRun: true };
-  }
-  try {
-    const result = await sqlFn();
-    console.log(`[LIVE] ✅ Executed: ${description}`);
-    return result;
-  } catch (err) {
-    console.error(`[LIVE] ❌ Failed: ${description}`, err.message);
-    throw err;
-  }
-}
-
 async function handleGoodsReceipt(syncEvent) {
-  console.log('\n  → Event 1: Goods Receipt (Auto)');
+  console.log('\n  → Event 1: Goods Receipt (Auto) — Review Queue Mode');
 
   const grnId = syncEvent.reference_id;
   console.log(`  GRN ID: ${grnId}`);
@@ -87,7 +70,7 @@ async function handleGoodsReceipt(syncEvent) {
     console.log(`  RM: ${item.raw_material_id} → ${rm?.name} (${rm?.sage_code})`);
   }
 
-  // Single connection — held open for ALL operations
+  // Validate items exist in Sage (read-only check, no posting)
   let pool;
   try {
     pool = await sql.connect(sageConfig);
@@ -101,7 +84,7 @@ async function handleGoodsReceipt(syncEvent) {
         continue;
       }
 
-      // Look up StockLink
+      // Look up StockLink (validation only)
       const stockResult = await pool.request()
         .input('Code', sql.VarChar, sageCode)
         .query(`SELECT StockLink FROM StkItem WHERE Code = @Code AND ItemActive = 1`);
@@ -111,59 +94,27 @@ async function handleGoodsReceipt(syncEvent) {
         continue;
       }
 
-      const stockLink   = stockResult.recordset[0].StockLink;
       const reference   = grn.grn_number.substring(0, 20);
       const description = (rmName || sageCode).substring(0, 40);
       const qty         = Number(item.received_qty);
       const cost        = Number(item.unit_cost || 0);
 
-      console.log(`  Processing: ${sageCode} — ${qty}kg @ $${cost}`);
+      console.log(`  Preparing: ${sageCode} — ${qty}kg @ $${cost}`);
 
-      await safeWrite(
-        `GRN receipt: ${qty}kg of ${sageCode} @ $${cost}/kg`,
-        async () => {
-          // Post directly to Sage (no journal batch, no manual QtyOnHand)
-          await postInventoryTransaction(pool, {
-            sageCode,
-            transactionType: 'grn',
-            quantity: qty,
-            whseId: 18,
-            unitCost: cost,
-            reference,
-            description,
-            transactionDate: new Date(grn.received_date)
-          });
-
-          console.log(`  ✅ Sage posted: ${sageCode} +${qty}kg into WhseID 18`);
-
-          // Get current stock for Supabase sync
-          const existing = await pool.request()
-            .input('StockID', sql.Int, stockLink)
-            .input('WhseID',  sql.Int, 18)
-            .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
-
-          const newQty = existing.recordset.length > 0 ? existing.recordset[0].QtyOnHand : qty;
-
-          // Sync to Supabase sage_stock_balances
-          try {
-            await supabase.rpc('set_sage_stock_balance', {
-              p_sage_code: sageCode,
-              p_warehouse_id: 18,
-              p_quantity: newQty
-            });
-            console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${newQty}kg`);
-          } catch (supabaseError) {
-            console.warn(`  ⚠️  Failed to sync to Supabase sage_stock_balances: ${supabaseError.message}`);
-          }
-
-          // Note: Do NOT overwrite fAverageCost — Sage's PostInventoryTxV2 handles weighted average calculation internally
-          console.log(`  ℹ️  Sage handles weighted average cost internally (no manual overwrite)`);
-        }
-      );
+      // Save to review queue instead of posting to Sage
+      await saveForReview(syncEvent.id, 'grn_confirmed', `GRN ${grn.grn_number} — ${rmName || sageCode}`, {
+        sageCode,
+        transactionType: 'grn',
+        quantity: qty,
+        whseId: 18,
+        unitCost: cost,
+        reference,
+        description,
+        transactionDate: new Date(grn.received_date),
+      });
     }
 
   } finally {
-    // Close ONCE after all operations complete
     if (pool) await sql.close();
     console.log(`  Connection closed.`);
   }
