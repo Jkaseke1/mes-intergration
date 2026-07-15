@@ -1,3 +1,4 @@
+
 -- Fix existing unposted batch lines created by the old bridge worker.
 -- IMPORTANT: Backup your Sage database before running this.
 -- The old bridge worker manually updated _etblStockQtys and wrote journal lines

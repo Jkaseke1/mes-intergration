@@ -2,9 +2,10 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
-const { postInventoryTransaction } = require('./lib/sagePost');
+const { postInventoryTransaction, getWarehouseLink } = require('./lib/sagePost');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
+const DISPATCH_SOURCE_WAREHOUSE_ID = parseInt(process.env.SAGE_DISPATCH_SOURCE_WAREHOUSE_ID, 10) || 17;
 
 const sageConfig = {
   server:   'localhost',
@@ -57,7 +58,8 @@ async function handleDispatch(syncEvent) {
   const { data: dispatch, error } = await supabase
     .from('dispatch_orders')
     .select(`
-      id, dispatch_number, dispatch_date, status,
+      id, dispatch_number, dispatch_date, status, warehouse_id,
+      warehouses:warehouse_id ( code ),
       branches ( id, name, sage_code )
     `)
     .eq('id', dispatchId)
@@ -70,6 +72,7 @@ async function handleDispatch(syncEvent) {
 
   console.log(`  Dispatch: ${dispatch.dispatch_number}`);
   console.log(`  Branch: ${dispatch.branches?.name} (${branchSageCode})`);
+  console.log(`  Selected MES warehouse: ${dispatch.warehouses?.code || 'none'}`);
 
   if (!destWhseLink) throw new Error(`No warehouse mapping for ${branchSageCode}`);
 
@@ -88,6 +91,18 @@ async function handleDispatch(syncEvent) {
   let pool;
   try {
     pool = await sql.connect(sageConfig);
+
+    // Resolve source warehouse from selected MES warehouse code, fallback to env
+    let sourceWhseLink = DISPATCH_SOURCE_WAREHOUSE_ID;
+    if (dispatch.warehouses?.code) {
+      const link = await getWarehouseLink(pool, dispatch.warehouses.code);
+      if (link) {
+        sourceWhseLink = link;
+        console.log(`  Source warehouse resolved from Sage: ${dispatch.warehouses.code} -> WhseLink ${sourceWhseLink}`);
+      } else {
+        console.log(`  ⚠️  Could not resolve WhseLink for ${dispatch.warehouses.code}, using fallback ${sourceWhseLink}`);
+      }
+    }
 
     for (const item of items) {
       const sageCode = item.formulations?.sage_code;
@@ -108,41 +123,49 @@ async function handleDispatch(syncEvent) {
       }
 
       const stockLink   = stockResult.recordset[0].StockLink;
+
+      // Fetch live AverageCost from Sage (pre-MES logic: WHT uses moving average cost, not selling price)
+      const costResult = await pool.request()
+        .input('Code', sql.VarChar, sageCode)
+        .query(`SELECT TOP 1 AverageCost FROM _bvWarehouseStockFull WHERE Code = @Code`);
+      const avgCost = costResult.recordset[0]?.AverageCost || 0;
+      console.log(`  Sage AverageCost: ${sageCode} = $${avgCost.toFixed(4)}/kg`);
+
       const reference   = dispatch.dispatch_number.substring(0, 20);
       const descOut     = `Dispatch to ${dispatch.branches?.name}`.substring(0, 40);
-      const descIn      = `Receipt fr DSP ${dispatch.dispatch_number}`.substring(0, 40);
+      const descIn      = `Receipt fr DEB ${dispatch.dispatch_number}`.substring(0, 40);
 
       console.log(`  Item: ${sageCode} — ${qty}kg to warehouse ${destWhseLink}`);
 
-      // Check DSP warehouse stock before dispatching
+      // Check dispatch source warehouse stock before dispatching
       const stockCheck = await pool.request()
         .input('StockID', sql.Int, stockLink)
-        .input('WhseID',  sql.Int, 20)
+        .input('WhseID',  sql.Int, sourceWhseLink)
         .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
 
       const currentStock = stockCheck.recordset.length > 0 ? stockCheck.recordset[0].QtyOnHand : 0;
-      
+
       if (currentStock < qty) {
-        throw new Error(`Insufficient stock in DSP: ${sageCode} has ${currentStock}kg but ${qty}kg requested`);
+        throw new Error(`Insufficient stock in source warehouse ${sourceWhseLink}: ${sageCode} has ${currentStock}kg but ${qty}kg requested`);
       }
 
       await safeWrite(
         `Dispatch ${qty}kg of ${sageCode} to ${dispatch.branches?.name}`,
         async () => {
-          // Post DSP issue (negative qty)
+          // Post source warehouse issue (negative qty)
           await postInventoryTransaction(pool, {
             sageCode,
             transactionType: 'dispatch',
             quantity: -qty,
-            whseId: 20,
-            unitCost: Number(item.unit_price || 0),
+            whseId: sourceWhseLink,
+            unitCost: avgCost,
             reference,
             reference2: dispatch.branches?.name || '',
             description: descOut,
             transactionDate: new Date(dispatch.dispatch_date)
           });
 
-          console.log(`  ✅ Sage posted: ${sageCode} -${qty}kg from WhseID 20 (DSP)`);
+          console.log(`  ✅ Sage posted: ${sageCode} -${qty}kg from WhseID ${sourceWhseLink}`);
 
           // Post branch receipt (positive qty)
           await postInventoryTransaction(pool, {
@@ -150,7 +173,7 @@ async function handleDispatch(syncEvent) {
             transactionType: 'dispatch',
             quantity: qty,
             whseId: destWhseLink,
-            unitCost: Number(item.unit_price || 0),
+            unitCost: avgCost,
             reference,
             reference2: dispatch.branches?.name || '',
             description: descIn,

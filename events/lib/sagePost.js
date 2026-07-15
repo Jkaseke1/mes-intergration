@@ -38,6 +38,13 @@ async function getWarehouseCode(pool, whseId) {
   return code;
 }
 
+async function getWarehouseLink(pool, code) {
+  const result = await pool.request()
+    .input('Code', sql.VarChar, code)
+    .query(`SELECT WhseLink FROM Whsemst WHERE Code = @Code`);
+  return result.recordset.length > 0 ? result.recordset[0].WhseLink : null;
+}
+
 async function postInventoryTransaction(pool, {
   sageCode,
   transactionType,
@@ -107,4 +114,5 @@ async function postInventoryTransaction(pool, {
 module.exports = {
   postInventoryTransaction,
   getWarehouseCode,
+  getWarehouseLink,
 };

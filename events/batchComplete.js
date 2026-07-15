@@ -4,6 +4,7 @@ const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
+const FG_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_WAREHOUSE_ID, 10) || 19;
 
 const sageConfig = {
   server:   'localhost',
@@ -88,10 +89,10 @@ async function handleBatchComplete(batchData) {
       return;
     }
 
-    // Step 2: Check current FG qty in Despatch Warehouse (20)
+    // Step 2: Check current FG qty in Production Warehouse (FG_WAREHOUSE_ID)
     const qtyCheck = await pool.request()
       .input('StockID', sql.Int, stockItem.StockLink)
-      .input('WhseID',  sql.Int, 20)
+      .input('WhseID',  sql.Int, FG_WAREHOUSE_ID)
       .query(`
         SELECT QtyOnHand
         FROM _etblStockQtys
@@ -100,7 +101,7 @@ async function handleBatchComplete(batchData) {
       `);
 
     const currentQty = qtyCheck.recordset[0]?.QtyOnHand ?? 0;
-    console.log(`Current FG qty : ${currentQty} ${batchData.unit} in Despatch Warehouse`);
+    console.log(`Current FG qty : ${currentQty} ${batchData.unit} in Production Warehouse (WhseID ${FG_WAREHOUSE_ID})`);
     console.log(`Receiving      : ${netQty} ${batchData.unit}`);
     console.log(`Expected after : ${currentQty + netQty} ${batchData.unit}`);
 
@@ -110,12 +111,12 @@ async function handleBatchComplete(batchData) {
     // Step 3: Write FG receipt journal line to Sage
     // fQtyIn on finished goods = production output received into stock
     await safeWrite(
-      `FG receipt: ${netQty}${batchData.unit} of ${batchData.product_sage_code} into Despatch Warehouse`,
+      `FG receipt: ${netQty}${batchData.unit} of ${batchData.product_sage_code} into Production Warehouse (WhseID ${FG_WAREHOUSE_ID})`,
       async () => {
         await pool.request()
           .input('iInvJrBatchID', sql.Int,      1)
           .input('iStockID',      sql.Int,      stockItem.StockLink)
-          .input('iWarehouseID',  sql.Int,      20)
+          .input('iWarehouseID',  sql.Int,      FG_WAREHOUSE_ID)
           .input('dTrDate',       sql.DateTime, new Date(batchData.completion_date))
           .input('iTrCodeID',     sql.Int,      31)
           .input('iGLContraID',   sql.Int,      0)
@@ -144,13 +145,13 @@ async function handleBatchComplete(batchData) {
       }
     );
 
-    // Step 4: Update FG QtyOnHand in Despatch Warehouse
+    // Step 4: Update FG QtyOnHand in Production Warehouse
     await safeWrite(
-      `Update FG QtyOnHand: ${batchData.product_sage_code} +${netQty} in Despatch Warehouse`,
+      `Update FG QtyOnHand: ${batchData.product_sage_code} +${netQty} in Production Warehouse (WhseID ${FG_WAREHOUSE_ID})`,
       async () => {
         const existing = await pool.request()
           .input('StockID', sql.Int, stockItem.StockLink)
-          .input('WhseID',  sql.Int, 20)
+          .input('WhseID',  sql.Int, FG_WAREHOUSE_ID)
           .query(`
             SELECT idStockQtys, QtyOnHand
             FROM _etblStockQtys
@@ -161,7 +162,7 @@ async function handleBatchComplete(batchData) {
         if (existing.recordset.length > 0) {
           await pool.request()
             .input('StockID', sql.Int,   stockItem.StockLink)
-            .input('WhseID',  sql.Int,   20)
+            .input('WhseID',  sql.Int,   FG_WAREHOUSE_ID)
             .input('QtyIn',   sql.Float, netQty)
             .query(`
               UPDATE _etblStockQtys
@@ -173,7 +174,7 @@ async function handleBatchComplete(batchData) {
         } else {
           await pool.request()
             .input('StockID', sql.Int,   stockItem.StockLink)
-            .input('WhseID',  sql.Int,   20)
+            .input('WhseID',  sql.Int,   FG_WAREHOUSE_ID)
             .input('QtyIn',   sql.Float, netQty)
             .query(`
               INSERT INTO _etblStockQtys (StockID, WhseID, QtyOnHand)
@@ -191,7 +192,7 @@ async function handleBatchComplete(batchData) {
     }
 
     console.log('\n✅ Batch completion processing complete');
-    console.log(`   ${batchData.batch_number} — ${netQty}${batchData.unit} of ${batchData.product_name} received into Despatch Warehouse`);
+    console.log(`   ${batchData.batch_number} — ${netQty}${batchData.unit} of ${batchData.product_name} received into Production Warehouse (WhseID ${FG_WAREHOUSE_ID})`);
 
   } catch (err) {
     console.error('\n❌ Batch complete failed:', err.message);

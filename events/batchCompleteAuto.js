@@ -5,6 +5,8 @@ const { createClient } = require('@supabase/supabase-js');
 const { postInventoryTransaction } = require('./lib/sagePost');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
+const FG_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_WAREHOUSE_ID, 10) || 19;
+const FG_TRANSFER_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_TRANSFER_WAREHOUSE_ID, 10) || 17;
 
 const sageConfig = {
   server:   'localhost',
@@ -117,37 +119,83 @@ async function handleBatchComplete(syncEvent) {
     const reference   = `WO-${order.batch_number}`.substring(0, 20);
     const description = `${order.formulations?.name} complete`.substring(0, 40);
 
+    const doTransfer = FG_TRANSFER_WAREHOUSE_ID && FG_TRANSFER_WAREHOUSE_ID !== FG_WAREHOUSE_ID;
+
     await safeWrite(
-      `FG receipt: ${netQty}kg of ${sageCode} into Despatch Warehouse`,
+      `FG receipt${doTransfer ? ' + transfer to DEB' : ''}: ${netQty}kg of ${sageCode} into WhseID ${FG_WAREHOUSE_ID}${doTransfer ? ` then ${FG_TRANSFER_WAREHOUSE_ID}` : ''}`,
       async () => {
         await postInventoryTransaction(pool, {
           sageCode,
           transactionType: 'production',
           quantity: netQty,
-          whseId: 20,
+          whseId: FG_WAREHOUSE_ID,
           unitCost: costPerUnit,
           reference,
           description,
           transactionDate: new Date()
         });
 
-        console.log(`  ✅ Sage posted: ${sageCode} +${netQty}kg into WhseID 20`);
+        console.log(`  ✅ Sage posted: ${sageCode} +${netQty}kg into WhseID ${FG_WAREHOUSE_ID}`);
 
-        // Sync to Supabase sage_stock_balances
+        if (doTransfer) {
+          await postInventoryTransaction(pool, {
+            sageCode,
+            transactionType: 'dispatch',
+            quantity: -netQty,
+            whseId: FG_WAREHOUSE_ID,
+            unitCost: costPerUnit,
+            reference,
+            description: 'Transfer to DEB',
+            transactionDate: new Date()
+          });
+
+          await postInventoryTransaction(pool, {
+            sageCode,
+            transactionType: 'dispatch',
+            quantity: netQty,
+            whseId: FG_TRANSFER_WAREHOUSE_ID,
+            unitCost: costPerUnit,
+            reference,
+            description: 'Transfer from PD',
+            transactionDate: new Date()
+          });
+
+          console.log(`  ✅ Transferred ${netQty}kg from WhseID ${FG_WAREHOUSE_ID} to WhseID ${FG_TRANSFER_WAREHOUSE_ID}`);
+        }
+
+        // Sync final balances to Supabase sage_stock_balances
         try {
+          const finalWarehouseId = doTransfer ? FG_TRANSFER_WAREHOUSE_ID : FG_WAREHOUSE_ID;
+
           const existing = await pool.request()
             .input('StockID', sql.Int, stockLink)
-            .input('WhseID',  sql.Int, 20)
+            .input('WhseID',  sql.Int, finalWarehouseId)
             .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
 
           const newQty = existing.recordset.length > 0 ? existing.recordset[0].QtyOnHand : netQty;
 
           await supabase.rpc('set_sage_stock_balance', {
             p_sage_code: sageCode,
-            p_warehouse_id: 20,
+            p_warehouse_id: finalWarehouseId,
             p_quantity: newQty
           });
-          console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${newQty}kg`);
+          console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${newQty}kg in WhseID ${finalWarehouseId}`);
+
+          if (doTransfer) {
+            const pdExisting = await pool.request()
+              .input('StockID', sql.Int, stockLink)
+              .input('WhseID',  sql.Int, FG_WAREHOUSE_ID)
+              .query(`SELECT QtyOnHand FROM _etblStockQtys WHERE StockID = @StockID AND WhseID = @WhseID`);
+
+            const pdQty = pdExisting.recordset.length > 0 ? pdExisting.recordset[0].QtyOnHand : 0;
+
+            await supabase.rpc('set_sage_stock_balance', {
+              p_sage_code: sageCode,
+              p_warehouse_id: FG_WAREHOUSE_ID,
+              p_quantity: pdQty
+            });
+            console.log(`  ✅ Supabase sage_stock_balances synced: ${sageCode} → ${pdQty}kg in WhseID ${FG_WAREHOUSE_ID}`);
+          }
         } catch (supabaseError) {
           console.warn(`  ⚠️  Failed to sync to Supabase sage_stock_balances: ${supabaseError.message}`);
         }

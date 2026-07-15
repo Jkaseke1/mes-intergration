@@ -4,6 +4,7 @@ const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
+const DISPATCH_SOURCE_WAREHOUSE_ID = parseInt(process.env.SAGE_DISPATCH_SOURCE_WAREHOUSE_ID, 10) || 17;
 
 const sageConfig = {
   server:   'localhost',
@@ -93,7 +94,7 @@ async function getWarehouseLink(pool, branchSageCode) {
 
 // ─── Event 4: Dispatch ────────────────────────────────────────────────────────
 // Triggered when dispatch_order status = 'delivered'
-// Moves FG stock from Despatch Warehouse (20) to branch warehouse
+// Moves FG stock from configured source warehouse (default DEB, 17) to branch warehouse
 async function handleDispatch(dispatchData) {
   console.log('\n─── Event 4: Dispatch ────────────────────────────────────');
   console.log(`Dispatch no.  : ${dispatchData.dispatch_number}`);
@@ -133,10 +134,10 @@ async function handleDispatch(dispatchData) {
         continue;
       }
 
-      // Check current FG qty in Despatch Warehouse
+      // Check current FG qty in source warehouse
       const qtyCheck = await pool.request()
         .input('StockID', sql.Int, stockItem.StockLink)
-        .input('WhseID',  sql.Int, 20)
+        .input('WhseID',  sql.Int, DISPATCH_SOURCE_WAREHOUSE_ID)
         .query(`
           SELECT QtyOnHand
           FROM _etblStockQtys
@@ -144,25 +145,25 @@ async function handleDispatch(dispatchData) {
           AND WhseID = @WhseID
         `);
 
-      const dspQty = qtyCheck.recordset[0]?.QtyOnHand ?? 0;
-      console.log(`  DSP qty   : ${dspQty} (before dispatch)`);
+      const sourceQty = qtyCheck.recordset[0]?.QtyOnHand ?? 0;
+      console.log(`  Source qty: ${sourceQty} (before dispatch)`);
 
-      if (dspQty < item.quantity && !DRY_RUN) {
-        console.warn(`  ⚠️  Only ${dspQty} available, dispatching ${item.quantity}`);
+      if (sourceQty < item.quantity && !DRY_RUN) {
+        console.warn(`  ⚠️  Only ${sourceQty} available, dispatching ${item.quantity}`);
       }
 
       const reference   = dispatchData.dispatch_number.substring(0, 20);
       const descOut     = `Dispatch to ${dispatchData.branch_name}`.substring(0, 40);
-      const descIn      = `Receipt fr DSP ${dispatchData.dispatch_number}`.substring(0, 40);
+      const descIn      = `Receipt fr DEB ${dispatchData.dispatch_number}`.substring(0, 40);
 
-      // Step 1: Issue from Despatch Warehouse (fQtyOut)
+      // Step 1: Issue from source warehouse (fQtyOut)
       await safeWrite(
-        `Issue ${item.quantity}${item.unit} of ${item.product_sage_code} from Despatch Warehouse`,
+        `Issue ${item.quantity}${item.unit} of ${item.product_sage_code} from warehouse ${DISPATCH_SOURCE_WAREHOUSE_ID}`,
         async () => {
           await pool.request()
             .input('iInvJrBatchID', sql.Int,      1)
             .input('iStockID',      sql.Int,      stockItem.StockLink)
-            .input('iWarehouseID',  sql.Int,      20)
+            .input('iWarehouseID',  sql.Int,      DISPATCH_SOURCE_WAREHOUSE_ID)
             .input('dTrDate',       sql.DateTime, new Date(dispatchData.dispatch_date))
             .input('iTrCodeID',     sql.Int,      31)
             .input('iGLContraID',   sql.Int,      0)
@@ -189,10 +190,10 @@ async function handleDispatch(dispatchData) {
               )
             `);
 
-          // Reduce DSP qty
+          // Reduce source qty
           await pool.request()
             .input('StockID', sql.Int,   stockItem.StockLink)
-            .input('WhseID',  sql.Int,   20)
+            .input('WhseID',  sql.Int,   DISPATCH_SOURCE_WAREHOUSE_ID)
             .input('QtyOut',  sql.Float, item.quantity)
             .query(`
               UPDATE _etblStockQtys
@@ -200,7 +201,7 @@ async function handleDispatch(dispatchData) {
               WHERE StockID = @StockID
               AND WhseID = @WhseID
             `);
-          console.log(`  DSP reduced: ${dspQty} → ${dspQty - item.quantity}`);
+          console.log(`  Source reduced: ${sourceQty} → ${sourceQty - item.quantity}`);
         }
       );
 
