@@ -430,13 +430,7 @@ BEGIN
             WHERE WHStockLink = @HarvestItemID
               AND WHQtyOnHand > 0;
 
-            -- Also update the item-level last GRV cost (if column exists)
-            IF COL_LENGTH('StkItem', 'fItemLastGRVCost') IS NOT NULL
-            BEGIN
-                UPDATE StkItem
-                SET fItemLastGRVCost = @UnitCost
-                WHERE StockLink = @HarvestItemID;
-            END
+            -- Note: StkItem.fItemLastGRVCost not updated (column doesn't exist in this Sage version)
         END
     END
 
