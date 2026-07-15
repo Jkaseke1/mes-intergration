@@ -1,6 +1,8 @@
 -- PostGRVV2 - GRV-specific posting with Trade Payables credit + cost revaluation
 -- Deployable version: drops existing SP then creates via sp_executesql to avoid GO batch separator issues
 
+USE [Hyperfeeds 2024 Live];
+
 IF OBJECT_ID('[dbo].[PostGRVV2]', 'P') IS NOT NULL
     DROP PROCEDURE [dbo].[PostGRVV2];
 
