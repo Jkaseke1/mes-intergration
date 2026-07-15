@@ -107,7 +107,7 @@ async function handleBatchComplete(syncEvent) {
       ? Math.round((totalMaterialCost / netQty) * 10000) / 10000
       : 0;
 
-    console.log(`  Total material cost: $${totalMaterialCost.toFixed(4)} / ${netQty}kg = $${costPerUnit.toFixed(4)}/kg`);
+    console.log(`  Total material cost (RM only): $${totalMaterialCost.toFixed(4)} / ${netQty}kg = $${costPerUnit.toFixed(4)}/kg`);
 
     const stockResult = await pool.request()
       .input('Code', sql.VarChar, sageCode)
@@ -116,6 +116,14 @@ async function handleBatchComplete(syncEvent) {
     if (stockResult.recordset.length === 0) throw new Error(`${sageCode} not found in Sage`);
 
     const stockLink   = stockResult.recordset[0].StockLink;
+
+    // Fetch live AverageCost from Sage for FG (pre-MES logic: MFMF uses moving average cost, not calculated RM cost)
+    const fgCostResult = await pool.request()
+      .input('Code', sql.VarChar, sageCode)
+      .query(`SELECT TOP 1 AverageCost FROM _bvWarehouseStockFull WHERE Code = @Code`);
+    const fgAvgCost = fgCostResult.recordset[0]?.AverageCost || 0;
+    console.log(`  Sage FG AverageCost: ${sageCode} = $${fgAvgCost.toFixed(4)}/kg (using this for MFMF + transfer)`);
+
     const reference   = `WO-${order.batch_number}`.substring(0, 20);
     const description = `${order.formulations?.name} complete`.substring(0, 40);
 
@@ -129,7 +137,7 @@ async function handleBatchComplete(syncEvent) {
           transactionType: 'production',
           quantity: netQty,
           whseId: FG_WAREHOUSE_ID,
-          unitCost: costPerUnit,
+          unitCost: fgAvgCost,
           reference,
           description,
           transactionDate: new Date()
@@ -143,7 +151,7 @@ async function handleBatchComplete(syncEvent) {
             transactionType: 'dispatch',
             quantity: -netQty,
             whseId: FG_WAREHOUSE_ID,
-            unitCost: costPerUnit,
+            unitCost: fgAvgCost,
             reference,
             description: 'Transfer to DEB',
             transactionDate: new Date()
@@ -154,7 +162,7 @@ async function handleBatchComplete(syncEvent) {
             transactionType: 'dispatch',
             quantity: netQty,
             whseId: FG_TRANSFER_WAREHOUSE_ID,
-            unitCost: costPerUnit,
+            unitCost: fgAvgCost,
             reference,
             description: 'Transfer from PD',
             transactionDate: new Date()
@@ -205,7 +213,7 @@ async function handleBatchComplete(syncEvent) {
     if (pool) await sql.close();
   }
 
-  // Write calculated cost_per_unit back to Supabase production_orders
+  // Write calculated RM cost_per_unit back to Supabase production_orders (for reporting/margin analysis only)
   if (costPerUnit > 0) {
     const { error: costUpdateError } = await supabase
       .from('production_orders')
@@ -218,7 +226,7 @@ async function handleBatchComplete(syncEvent) {
     if (costUpdateError) {
       console.warn(`  cost_per_unit write to Supabase failed: ${costUpdateError.message}`);
     } else {
-      console.log(`  cost_per_unit saved to Supabase: $${costPerUnit.toFixed(4)}/kg`);
+      console.log(`  RM cost_per_unit saved to Supabase (reporting only): $${costPerUnit.toFixed(4)}/kg | Sage AverageCost: $${fgAvgCost ? fgAvgCost.toFixed(4) : 'N/A'}/kg`);
     }
   }
 }
