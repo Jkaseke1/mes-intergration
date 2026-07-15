@@ -5,8 +5,14 @@
 --
 -- Based on PostInventoryTxV2 but adds:
 --   - Trade Payables as contra (instead of generic GRN Accrual)
---   - Cost revaluation across all warehouses holding the item
---   - Updates fAverageCost for all warehouses
+--   - Cost revaluation GL entries for difference between old and new weighted average
+--
+-- Schema notes (verified from Hyperfeeds 2024 Live):
+--   - WhseStk is EMPTY (0 rows) — not used in this database
+--   - Stock quantities: _etblStockQtys (StockID, WhseID, QtyOnHand)
+--   - Stock costs: _etblStockCosts (StockID, WhseID, AverageCost, LastGRVCost)
+--   - _bspPostStTrans is encrypted — automatically updates _etblStockQtys and _etblStockCosts
+--   - Cost revaluation GL entries are NOT posted by _bspPostStTrans — we must post them
 
 CREATE PROCEDURE [dbo].[PostGRVV2]
     @ItemCode varchar(50),
@@ -121,29 +127,29 @@ BEGIN
 
     -- ========================================================================
     -- STEP 1: Capture old stock state for cost revaluation
+    -- Read from _etblStockQtys (quantities) and _etblStockCosts (costs)
     -- ========================================================================
     SELECT
-        @OldTotalQty = COALESCE(SUM(WHQtyOnHand), 0),
-        @OldTotalValue = COALESCE(SUM(WHQtyOnHand * COALESCE(fAverageCost, 0)), 0)
-    FROM WhseStk
-    WHERE WHStockLink = @HarvestItemID
-      AND WHQtyOnHand > 0;
+        @OldTotalQty = COALESCE(SUM(QtyOnHand), 0)
+    FROM _etblStockQtys
+    WHERE StockID = @HarvestItemID
+      AND QtyOnHand > 0;
 
-    -- Fallback: if WhseStk has no rows, check _etblStockQtys
-    IF @OldTotalQty = 0
-    BEGIN
-        SELECT
-            @OldTotalQty = COALESCE(SUM(QtyOnHand), 0),
-            @OldTotalValue = 0
-        FROM _etblStockQtys
-        WHERE StockID = @HarvestItemID
-          AND QtyOnHand > 0;
-    END
+    -- Get the item-level average cost (WhseID = 0 is the global/item-level cost)
+    SELECT @OldWeightedAvg = COALESCE(
+        (SELECT TOP 1 AverageCost FROM _etblStockCosts WHERE StockID = @HarvestItemID AND WhseID = 0),
+        0
+    );
 
-    IF @OldTotalQty > 0
-        SELECT @OldWeightedAvg = @OldTotalValue / @OldTotalQty;
+    -- If no existing stock, no variance to calculate
+    IF @OldTotalQty > 0 AND @OldWeightedAvg > 0
+        SELECT @OldTotalValue = @OldTotalQty * @OldWeightedAvg;
     ELSE
+    BEGIN
+        SELECT @OldTotalQty = 0;
+        SELECT @OldTotalValue = 0;
         SELECT @OldWeightedAvg = @UnitCost;
+    END
 
     -- ========================================================================
     -- STEP 2: Post stock receipt (same as PostInventoryTxV2)
@@ -434,14 +440,9 @@ BEGIN
                 0, 0, 0, 0, 0,
                 '', 0, 0, '';
 
-            -- Update fAverageCost for ALL warehouses holding this item
-            UPDATE WhseStk
-            SET fAverageCost = @NewWeightedAvg,
-                fWhseLastGRVCost = @UnitCost
-            WHERE WHStockLink = @HarvestItemID
-              AND WHQtyOnHand > 0;
-
-            -- Note: StkItem.fItemLastGRVCost not updated (column doesn't exist in this Sage version)
+            -- Note: _bspPostStTrans already updates _etblStockCosts.AverageCost internally
+            -- We only need to post the GL variance entries (above)
+            -- Do NOT update _etblStockCosts ourselves — _bspPostStTrans handles it
         END
     END
 
