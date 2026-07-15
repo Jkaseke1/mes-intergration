@@ -368,6 +368,8 @@ BEGIN
             END
 
             -- Post Variance GL entry (Purchase Cost Variance)
+            DECLARE @VarianceDesc varchar(255);
+            SET @VarianceDesc = @Description + ' (Cost Revaluation)';
             SELECT @AutoIdx = 0;
             EXECUTE @RC = _bspPostGLTrans
                 @AutoIdx OUTPUT,
@@ -378,7 +380,7 @@ BEGIN
                 @VarianceDebit,
                 @VarianceCredit,
                 0, 0, 0, 0,
-                @Description + ' (Cost Revaluation)',
+                @VarianceDesc,
                 0,
                 @Reference,
                 '', '',
@@ -405,7 +407,7 @@ BEGIN
                 @StockDebit,
                 @StockCredit,
                 0, 0, 0, 0,
-                @Description + ' (Cost Revaluation)',
+                @VarianceDesc,
                 0,
                 @Reference,
                 '', '',
