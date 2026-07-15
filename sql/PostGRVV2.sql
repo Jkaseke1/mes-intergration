@@ -123,11 +123,11 @@ BEGIN
     -- STEP 1: Capture old stock state for cost revaluation
     -- ========================================================================
     SELECT
-        @OldTotalQty = COALESCE(SUM(QtyOnHand), 0),
-        @OldTotalValue = COALESCE(SUM(QtyOnHand * fAverageCost), 0)
+        @OldTotalQty = COALESCE(SUM(WHQtyOnHand), 0),
+        @OldTotalValue = COALESCE(SUM(WHQtyOnHand * fAverageCost), 0)
     FROM WhseStk
     WHERE WHStockLink = @HarvestItemID
-      AND QtyOnHand > 0;
+      AND WHQtyOnHand > 0;
 
     IF @OldTotalQty > 0
         SELECT @OldWeightedAvg = @OldTotalValue / @OldTotalQty;
@@ -430,10 +430,13 @@ BEGIN
             WHERE WHStockLink = @HarvestItemID
               AND WHQtyOnHand > 0;
 
-            -- Also update the item-level average cost
-            UPDATE StkItem
-            SET fItemLastGRVCost = @UnitCost
-            WHERE StockLink = @HarvestItemID;
+            -- Also update the item-level last GRV cost (if column exists)
+            IF COL_LENGTH('StkItem', 'fItemLastGRVCost') IS NOT NULL
+            BEGIN
+                UPDATE StkItem
+                SET fItemLastGRVCost = @UnitCost
+                WHERE StockLink = @HarvestItemID;
+            END
         END
     END
 
