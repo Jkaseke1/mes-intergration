@@ -124,10 +124,21 @@ BEGIN
     -- ========================================================================
     SELECT
         @OldTotalQty = COALESCE(SUM(WHQtyOnHand), 0),
-        @OldTotalValue = COALESCE(SUM(WHQtyOnHand * fAverageCost), 0)
+        @OldTotalValue = COALESCE(SUM(WHQtyOnHand * COALESCE(fAverageCost, 0)), 0)
     FROM WhseStk
     WHERE WHStockLink = @HarvestItemID
       AND WHQtyOnHand > 0;
+
+    -- Fallback: if WhseStk has no rows, check _etblStockQtys
+    IF @OldTotalQty = 0
+    BEGIN
+        SELECT
+            @OldTotalQty = COALESCE(SUM(QtyOnHand), 0),
+            @OldTotalValue = 0
+        FROM _etblStockQtys
+        WHERE StockID = @HarvestItemID
+          AND QtyOnHand > 0;
+    END
 
     IF @OldTotalQty > 0
         SELECT @OldWeightedAvg = @OldTotalValue / @OldTotalQty;
