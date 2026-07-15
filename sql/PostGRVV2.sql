@@ -446,5 +446,29 @@ BEGIN
         END
     END
 
+    -- ========================================================================
+    -- STEP 4: Update LastGRVCost for global and receiving warehouse
+    -- _bspPostStTrans updates AverageCost but does not update LastGRVCost,
+    -- so we set it explicitly for the GRN receipt cost.
+    -- ========================================================================
+    UPDATE _etblStockCosts
+    SET LastGRVCost = @UnitCost
+    WHERE StockID = @HarvestItemID
+      AND WhseID IN (0, @WarehouseID);
+
+    -- If the receiving warehouse does not have a cost row yet, create it
+    IF @@ROWCOUNT = 0 OR NOT EXISTS (
+        SELECT 1 FROM _etblStockCosts
+        WHERE StockID = @HarvestItemID AND WhseID = @WarehouseID
+    )
+    BEGIN
+        INSERT INTO _etblStockCosts (StockID, WhseID, AverageCost, LastGRVCost)
+        SELECT
+            @HarvestItemID,
+            @WarehouseID,
+            COALESCE((SELECT AverageCost FROM _etblStockCosts WHERE StockID = @HarvestItemID AND WhseID = 0), @UnitCost),
+            @UnitCost;
+    END
+
     RETURN 0;
 END;
