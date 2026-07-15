@@ -115,15 +115,21 @@ async function processPendingEvents() {
       }
 
       // Mark as pending_finance_review (handlers now save to review queue, not Sage)
+      // Exception: rm_cost_updated updates WhseStk.fAverageCost directly — no review needed
+      const directComplete = event.event_type === 'rm_cost_updated';
+
       await supabase
         .from('sync_log')
         .update({
-          status:     'pending_finance_review',
+          status:     directComplete ? 'success' : 'pending_finance_review',
           updated_at: new Date().toISOString(),
         })
         .eq('id', event.id);
 
-      console.log(`  📋 ${event.event_type} prepared for finance review`);
+      console.log(directComplete
+        ? `  ✅ ${event.event_type} processed directly (no review needed)`
+        : `  📋 ${event.event_type} prepared for finance review`
+      );
 
     } catch (err) {
       console.error(`  ❌ Failed: ${err.message}`);
