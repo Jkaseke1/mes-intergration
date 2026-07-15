@@ -14,7 +14,8 @@
 --   - _bspPostStTrans is encrypted — automatically updates _etblStockQtys and _etblStockCosts
 --   - Cost revaluation GL entries are NOT posted by _bspPostStTrans — we must post them
 
-DROP PROCEDURE IF EXISTS [dbo].[PostGRVV2];
+IF OBJECT_ID('[dbo].[PostGRVV2]', 'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[PostGRVV2];
 GO
 
 CREATE PROCEDURE [dbo].[PostGRVV2]
