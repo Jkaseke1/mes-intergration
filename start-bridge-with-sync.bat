@@ -13,8 +13,8 @@ start "Bridge Worker" cmd /k "cd /d %~dp0events && node bridgeworker.js"
 
 echo.
 echo ✅ Both services started!
-echo    - Stock Sync Scheduler (syncs every hour)
-echo    - Bridge Worker (processes events)
+echo    - Stock Sync Scheduler (syncs every 5 minutes)
+echo    - Bridge Worker (processes events every 30 seconds)
 echo.
 echo Close the command windows to stop the services.
 pause

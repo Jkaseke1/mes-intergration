@@ -28,7 +28,7 @@ const sageConfig = {
 
 const RM_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_RM_WAREHOUSE_ID, 10) || 18;
 const FG_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_WAREHOUSE_ID, 10) || 17;
-const SYNC_INTERVAL_MS = parseInt(process.env.STOCK_SYNC_INTERVAL_MINUTES, 10) * 60 * 1000 || 3600000; // Default 1 hour
+const SYNC_INTERVAL_MS = parseInt(process.env.STOCK_SYNC_INTERVAL_MINUTES, 10) * 60 * 1000 || 300000; // Default 5 minutes
 
 async function syncStockFromSage() {
   console.log(`\n🔄 [${new Date().toISOString()}] Starting automatic stock sync...`);

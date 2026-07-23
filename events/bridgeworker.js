@@ -1,6 +1,7 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const { createClient } = require('@supabase/supabase-js');
+const { fork } = require('child_process');
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -9,6 +10,12 @@ const supabase = createClient(
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 const POLL_INTERVAL_MS = 30000;
+
+// Auto-start stock sync scheduler in a child process so bridgeworker alone keeps stock fresh
+const schedulerPath = path.join(__dirname, 'stockSyncScheduler.js');
+const scheduler = fork(schedulerPath, [], { stdio: 'inherit' });
+scheduler.on('error', (err) => console.error('❌ Scheduler failed to start:', err.message));
+scheduler.on('exit', (code) => console.error(`❌ Scheduler exited with code ${code}`));
 
 // Import event handlers
 const { handleGoodsReceipt }  = require('./goodsReceiptAuto');
@@ -155,6 +162,7 @@ async function startWorker() {
   console.log(` Mode: ${DRY_RUN ? 'DRY RUN' : 'LIVE'}`);
   console.log(` Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
   console.log('==============================================\n');
+  if (scheduler) console.log('📦 Stock sync scheduler started automatically\n');
   console.log('Two-phase mode: PREPARE → FINANCE REVIEW → POST');
   console.log('Phase 1: Preparing pending events for review');
   console.log('Phase 2: Posting finance-approved reviews to Sage\n');
