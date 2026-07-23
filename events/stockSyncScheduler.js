@@ -90,6 +90,7 @@ async function syncStockFromSage() {
           }
         }
       } catch (err) {
+        console.warn(`  ⚠️ RM sync error for ${material?.sage_code || material?.code}: ${err.message}`);
         errors++;
       }
     }
@@ -143,6 +144,7 @@ async function syncStockFromSage() {
           }
         }
       } catch (err) {
+        console.warn(`  ⚠️ FG sync error for ${form?.sage_code || form?.name}: ${err.message}`);
         errors++;
       }
     }
