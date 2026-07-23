@@ -21,10 +21,11 @@ const { handleRMCostUpdate }      = require('./rmCostUpdateAuto');
 const { postApprovedReviews }     = require('./postApprovedReviews');
 
 async function processPendingEvents() {
+  // Fetch pending events AND failed events past their retry time
   const { data: pending, error } = await supabase
     .from('sync_log')
     .select('*')
-    .eq('status', 'pending')
+    .or(`status.eq.pending,and(status.eq.failed,next_retry_at.lte.${new Date().toISOString()})`)
     .order('created_at', { ascending: true })
     .limit(10);
 
