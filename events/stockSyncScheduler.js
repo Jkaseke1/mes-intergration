@@ -5,6 +5,8 @@
  */
 
 require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -12,6 +14,9 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
+
+const POSTING_LOCK_FILE = path.join(__dirname, '..', 'sage-posting.lock');
+const LOCK_STALE_MS = 5 * 60 * 1000; // 5 minutes
 
 const sageConfig = {
   server: 'localhost',
@@ -30,11 +35,46 @@ const RM_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_RM_WAREHOUSE_ID, 10) || 1
 const FG_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_WAREHOUSE_ID, 10) || 17;
 const SYNC_INTERVAL_MS = parseInt(process.env.STOCK_SYNC_INTERVAL_MINUTES, 10) * 60 * 1000 || 300000; // Default 5 minutes
 
+let isSyncing = false;
+
+function isPostingActive() {
+  try {
+    if (!fs.existsSync(POSTING_LOCK_FILE)) return false;
+    const ts = fs.readFileSync(POSTING_LOCK_FILE, 'utf8');
+    const lockTime = new Date(ts).getTime();
+    if (isNaN(lockTime)) {
+      fs.unlinkSync(POSTING_LOCK_FILE);
+      return false;
+    }
+    const age = Date.now() - lockTime;
+    if (age > LOCK_STALE_MS) {
+      fs.unlinkSync(POSTING_LOCK_FILE);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function syncStockFromSage() {
+  if (isSyncing) {
+    console.log('⏭️  Stock sync already running; skipping this cycle');
+    return;
+  }
+
+  if (isPostingActive()) {
+    console.log('⏸️  Sage posting in progress; skipping stock sync this cycle');
+    return;
+  }
+
+  isSyncing = true;
   console.log(`\n🔄 [${new Date().toISOString()}] Starting automatic stock sync...`);
+
+  let pool = null;
   
   try {
-    const pool = await sql.connect(sageConfig);
+    pool = await sql.connect(sageConfig);
 
     let synced = 0;
     let errors = 0;
@@ -149,12 +189,15 @@ async function syncStockFromSage() {
       }
     }
 
-    await pool.close();
-
     console.log(`✅ Sync complete: ${synced} synced (${(materials?.length||0)} RM + ${(formulations?.length||0)} FG), ${changed} changed, ${errors} errors`);
 
   } catch (error) {
     console.error('❌ Stock sync failed:', error.message);
+  } finally {
+    if (pool) {
+      try { await pool.close(); } catch (e) { /* ignore */ }
+    }
+    isSyncing = false;
   }
 }
 

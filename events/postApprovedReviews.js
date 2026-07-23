@@ -2,6 +2,7 @@
 // This is the second phase of the two-phase posting flow
 
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
@@ -10,6 +11,8 @@ const { checkAllReviewsFinalized } = require('./lib/reviewQueue');
 const { syncAfterPosting } = require('./lib/syncStock');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
+const POSTING_LOCK_FILE = path.join(__dirname, '..', 'sage-posting.lock');
+const LOCK_STALE_MS = 5 * 60 * 1000; // 5 minutes
 
 const sageConfig = {
   server: 'localhost',
@@ -31,6 +34,18 @@ const supabase = createClient(
 
 let isPosting = false;
 
+function setPostingLock() {
+  try {
+    fs.writeFileSync(POSTING_LOCK_FILE, new Date().toISOString());
+  } catch (e) { /* ignore */ }
+}
+
+function clearPostingLock() {
+  try {
+    if (fs.existsSync(POSTING_LOCK_FILE)) fs.unlinkSync(POSTING_LOCK_FILE);
+  } catch (e) { /* ignore */ }
+}
+
 async function postApprovedReviews() {
   // Guard against overlapping executions since this can take > poll interval
   if (isPosting) {
@@ -38,6 +53,7 @@ async function postApprovedReviews() {
     return;
   }
   isPosting = true;
+  setPostingLock();
 
   // Fetch approved but not-yet-posted reviews
   const { data: approved, error } = await supabase
@@ -51,11 +67,13 @@ async function postApprovedReviews() {
   if (error) {
     console.error('❌ Failed to fetch approved reviews:', error.message);
     isPosting = false;
+    clearPostingLock();
     return;
   }
 
   if (!approved || approved.length === 0) {
     isPosting = false;
+    clearPostingLock();
     return;
   }
 
@@ -173,6 +191,7 @@ async function postApprovedReviews() {
       try { await pool.close(); } catch (e) { /* ignore */ }
     }
     isPosting = false;
+    clearPostingLock();
   }
 }
 
