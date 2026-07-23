@@ -77,20 +77,27 @@ async function postApprovedReviews() {
         if (DRY_RUN) {
           console.log(`  [DRY RUN] Would post to Sage`);
         } else {
-          const result = await postInventoryTransaction(pool, {
-            sageCode: review.sage_code,
-            transactionType: review.transaction_type,
-            quantity: review.quantity,
-            whseId: review.warehouse_id,
-            unitCost: review.unit_cost,
-            reference: review.reference,
-            reference2: review.reference2,
-            description: review.description,
-            transactionDate: new Date(review.transaction_date),
-          });
+          // Idempotency: if Sage already has a matching transaction, skip re-posting
+          const alreadyPosted = await isAlreadyPosted(pool, review);
+          if (alreadyPosted) {
+            console.log(`  ⚡ Already posted in Sage — skipping`);
+            postedSageCodes.add(review.sage_code);
+          } else {
+            const result = await postInventoryTransaction(pool, {
+              sageCode: review.sage_code,
+              transactionType: review.transaction_type,
+              quantity: review.quantity,
+              whseId: review.warehouse_id,
+              unitCost: review.unit_cost,
+              reference: review.reference,
+              reference2: review.reference2,
+              description: review.description,
+              transactionDate: new Date(review.transaction_date),
+            });
 
-          console.log(`  ✅ Sage posted: ${review.sage_code} ${review.sage_tx_code}`);
-          postedSageCodes.add(review.sage_code);
+            console.log(`  ✅ Sage posted: ${review.sage_code} ${review.sage_tx_code}`);
+            postedSageCodes.add(review.sage_code);
+          }
 
           // Mark as posted
           await supabase
@@ -166,6 +173,38 @@ async function postApprovedReviews() {
       try { await pool.close(); } catch (e) { /* ignore */ }
     }
     isPosting = false;
+  }
+}
+
+async function isAlreadyPosted(pool, review) {
+  try {
+    const whCode = review.warehouse_code || await getWarehouseCode(pool, review.warehouse_id);
+    const qty = Number(review.quantity);
+    const absQty = Math.abs(qty);
+
+    const result = await pool.request()
+      .input('TrCode', sql.VarChar, review.sage_tx_code)
+      .input('WarehouseCode', sql.VarChar, whCode)
+      .input('Reference', sql.VarChar, review.reference)
+      .input('Qty', sql.Float, absQty)
+      .query(`
+        SELECT TOP 1 AutoIdx
+        FROM _bvSTTransactionsFull
+        WHERE TrCode = @TrCode
+          AND WarehouseCode = @WarehouseCode
+          AND Reference = @Reference
+          AND (
+            (QtyIn IS NOT NULL AND ABS(QtyIn - @Qty) < 0.001)
+            OR
+            (QtyOut IS NOT NULL AND ABS(QtyOut - @Qty) < 0.001)
+          )
+      `);
+
+    return result.recordset.length > 0;
+  } catch (err) {
+    // If we can't verify, assume not posted to be safe (but log it)
+    console.warn(`  ⚠️  Could not check idempotency: ${err.message}`);
+    return false;
   }
 }
 
