@@ -113,16 +113,26 @@ async function postApprovedReviews() {
         await syncStockBalance(pool, review);
 
       } catch (err) {
-        const errorMessage = err.message || err.originalError?.message || err.code || JSON.stringify(err);
-        console.error(`  ❌ Failed to post: ${errorMessage}`);
+        const fullMessage = JSON.stringify(err, Object.getOwnPropertyNames(err));
+        const displayMessage = err.message || err.originalError?.message || err.code || fullMessage;
+        console.error(`  ❌ Failed to post: ${displayMessage}`);
+
+        // Permanent Sage errors that should not be retried (e.g. negative stock)
+        const permanent = /negative|not allowed|not found|invalid|cannot/i.test(fullMessage);
+        const now = new Date().toISOString();
 
         await supabase
           .from('sage_posting_reviews')
           .update({
-            sage_result: { success: false, error: errorMessage, posted_at: new Date().toISOString() },
-            updated_at: new Date().toISOString(),
+            ...(permanent ? { posted_at: now } : {}),
+            sage_result: { success: false, error: displayMessage, full_error: fullMessage, attempted_at: now },
+            updated_at: now,
           })
           .eq('id', review.id);
+
+        if (permanent) {
+          console.warn(`  ⛔ Permanent error — review marked as failed and will not be retried`);
+        }
       }
     }
 
