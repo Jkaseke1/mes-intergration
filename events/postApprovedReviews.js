@@ -29,7 +29,16 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+let isPosting = false;
+
 async function postApprovedReviews() {
+  // Guard against overlapping executions since this can take > poll interval
+  if (isPosting) {
+    console.log('⏭️  postApprovedReviews already running; skipping this poll');
+    return;
+  }
+  isPosting = true;
+
   // Fetch approved but not-yet-posted reviews
   const { data: approved, error } = await supabase
     .from('sage_posting_reviews')
@@ -41,19 +50,25 @@ async function postApprovedReviews() {
 
   if (error) {
     console.error('❌ Failed to fetch approved reviews:', error.message);
+    isPosting = false;
     return;
   }
 
-  if (!approved || approved.length === 0) return;
+  if (!approved || approved.length === 0) {
+    isPosting = false;
+    return;
+  }
 
   console.log(`\n[${new Date().toISOString()}] Found ${approved.length} approved review(s) to post`);
 
-  let pool;
+  // Use a dedicated pool so closing it does not kill the global pool
+  let pool = new sql.ConnectionPool(sageConfig);
   try {
-    pool = await sql.connect(sageConfig);
+    pool = await pool.connect();
 
     // Group by sync_event_id so we can update sync_log after all postings
     const eventsMap = new Map();
+    const postedSageCodes = new Set();
 
     for (const review of approved) {
       console.log(`\n  Posting: ${review.sage_code} ${review.sage_tx_code} ${review.quantity}kg @ $${review.unit_cost} (WhseID ${review.warehouse_id})`);
@@ -75,6 +90,7 @@ async function postApprovedReviews() {
           });
 
           console.log(`  ✅ Sage posted: ${review.sage_code} ${review.sage_tx_code}`);
+          postedSageCodes.add(review.sage_code);
 
           // Mark as posted
           await supabase
@@ -97,12 +113,13 @@ async function postApprovedReviews() {
         await syncStockBalance(pool, review);
 
       } catch (err) {
-        console.error(`  ❌ Failed to post: ${err.message}`);
+        const errorMessage = err.message || err.originalError?.message || err.code || JSON.stringify(err);
+        console.error(`  ❌ Failed to post: ${errorMessage}`);
 
         await supabase
           .from('sage_posting_reviews')
           .update({
-            sage_result: { success: false, error: err.message, posted_at: new Date().toISOString() },
+            sage_result: { success: false, error: errorMessage, posted_at: new Date().toISOString() },
             updated_at: new Date().toISOString(),
           })
           .eq('id', review.id);
@@ -110,9 +127,9 @@ async function postApprovedReviews() {
     }
 
     // Batch sync all materials that were posted
-    const postedSageCodes = [...new Set(approved.map(r => r.sage_code))];
-    if (postedSageCodes.length > 0 && !DRY_RUN) {
-      await syncAfterPosting(pool, supabase, postedSageCodes, 'Finance Posting');
+    const postedCodesArray = Array.from(postedSageCodes);
+    if (postedCodesArray.length > 0 && !DRY_RUN) {
+      await syncAfterPosting(pool, supabase, postedCodesArray, 'Finance Posting');
     }
 
     // Check if all reviews for each event are finalized, then mark sync_log as success
@@ -132,9 +149,13 @@ async function postApprovedReviews() {
     }
 
   } catch (err) {
-    console.error('❌ postApprovedReviews failed:', err.message);
+    const errorMessage = err.message || err.originalError?.message || err.code || JSON.stringify(err);
+    console.error('❌ postApprovedReviews failed:', errorMessage);
   } finally {
-    if (pool) await sql.close();
+    if (pool) {
+      try { await pool.close(); } catch (e) { /* ignore */ }
+    }
+    isPosting = false;
   }
 }
 

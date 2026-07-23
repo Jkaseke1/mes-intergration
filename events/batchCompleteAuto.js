@@ -62,9 +62,10 @@ async function handleBatchComplete(syncEvent) {
   let costPerUnit = 0;
   let fgAvgCost = 0;
 
-  let pool;
+  // Use a dedicated pool so closing it does not affect the global pool shared with other services
+  let pool = new sql.ConnectionPool(sageConfig);
   try {
-    pool = await sql.connect(sageConfig);
+    pool = await pool.connect();
 
     // Fetch live average costs from Sage for each ingredient (reporting only)
     if (materials && materials.length > 0) {
@@ -164,7 +165,9 @@ async function handleBatchComplete(syncEvent) {
 
 
   } finally {
-    if (pool) await sql.close();
+    if (pool) {
+      try { await pool.close(); } catch (e) { /* ignore */ }
+    }
   }
 
   // Write calculated RM cost_per_unit back to Supabase production_orders (for reporting/margin analysis only)
