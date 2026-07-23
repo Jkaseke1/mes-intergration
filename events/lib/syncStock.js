@@ -1,6 +1,6 @@
 /**
  * On-demand stock sync helper
- * Syncs specific materials or all materials from Sage to MES
+ * Syncs specific materials or all materials from Sage to MES sage_stock_balances
  */
 
 const sql = require('mssql');
@@ -16,17 +16,6 @@ const RM_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_RM_WAREHOUSE_ID, 10) || 1
  */
 async function syncMaterialStock(pool, supabase, sageCodes = []) {
   try {
-    // Get RM warehouse
-    const { data: rmWarehouse, error: whError } = await supabase
-      .from('warehouses')
-      .select('id')
-      .eq('code', 'RM')
-      .single();
-
-    if (whError || !rmWarehouse) {
-      throw new Error(`RM warehouse not found: ${whError?.message || 'No data'}`);
-    }
-
     // Build query for materials
     let materialsQuery = supabase
       .from('raw_materials')
@@ -65,19 +54,15 @@ async function syncMaterialStock(pool, supabase, sageCodes = []) {
 
         const sageQty = Number(result.recordset[0]?.QtyOnHand || 0);
 
-        // Update MES stock balance
-        const { error: upsertError } = await supabase
-          .from('warehouse_stock_balances')
-          .upsert({
-            raw_material_id: material.id,
-            warehouse_id: rmWarehouse.id,
-            quantity: sageQty,
-          }, {
-            onConflict: 'raw_material_id,warehouse_id'
-          });
+        // Update MES sage_stock_balances
+        const { error: rpcError } = await supabase.rpc('set_sage_stock_balance', {
+          p_sage_code: material.sage_code,
+          p_warehouse_id: RM_SAGE_WAREHOUSE_ID,
+          p_quantity: sageQty,
+        });
 
-        if (upsertError) {
-          console.error(`  ⚠️  Sync failed for ${material.code}: ${upsertError.message}`);
+        if (rpcError) {
+          console.error(`  ⚠️  Sync failed for ${material.code}: ${rpcError.message}`);
           errors++;
         } else {
           synced++;

@@ -1,6 +1,6 @@
 /**
  * Stock Sync Scheduler
- * Automatically syncs MES stock balances with Sage every hour
+ * Automatically syncs MES sage_stock_balances with Sage every hour
  * Run this alongside the bridge worker
  */
 
@@ -43,16 +43,6 @@ async function syncStockFromSage() {
 
     if (matError) throw matError;
 
-    const { data: rmWarehouse, error: whError } = await supabase
-      .from('warehouses')
-      .select('id')
-      .eq('code', 'RM')
-      .single();
-
-    if (whError || !rmWarehouse) {
-      throw new Error(`RM warehouse not found: ${whError?.message || 'No data'}`);
-    }
-
     let synced = 0;
     let errors = 0;
     let changed = 0;
@@ -73,26 +63,22 @@ async function syncStockFromSage() {
 
         // Check if quantity changed
         const { data: existing } = await supabase
-          .from('warehouse_stock_balances')
+          .from('sage_stock_balances')
           .select('quantity')
-          .eq('raw_material_id', material.id)
-          .eq('warehouse_id', rmWarehouse.id)
+          .eq('sage_code', material.sage_code)
+          .eq('warehouse_id', RM_SAGE_WAREHOUSE_ID)
           .single();
 
         const oldQty = Number(existing?.quantity || 0);
         const qtyChanged = Math.abs(sageQty - oldQty) > 0.001;
 
-        const { error: upsertError } = await supabase
-          .from('warehouse_stock_balances')
-          .upsert({
-            raw_material_id: material.id,
-            warehouse_id: rmWarehouse.id,
-            quantity: sageQty,
-          }, {
-            onConflict: 'raw_material_id,warehouse_id'
-          });
+        const { error: rpcError } = await supabase.rpc('set_sage_stock_balance', {
+          p_sage_code: material.sage_code,
+          p_warehouse_id: RM_SAGE_WAREHOUSE_ID,
+          p_quantity: sageQty,
+        });
 
-        if (upsertError) {
+        if (rpcError) {
           errors++;
         } else {
           synced++;

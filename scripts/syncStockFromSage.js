@@ -1,5 +1,5 @@
 /**
- * Sync MES warehouse stock balances with Sage live quantities
+ * Sync MES sage_stock_balances with Sage live quantities
  * Run this when MES stock is stale or out of sync
  */
 
@@ -43,19 +43,8 @@ async function syncStockFromSage() {
     if (matError) throw matError;
     console.log(`📦 Found ${materials.length} active materials to sync`);
 
-    // Get RM warehouse from MES
-    const { data: rmWarehouse, error: whError } = await supabase
-      .from('warehouses')
-      .select('id')
-      .eq('code', 'RM')
-      .single();
-
-    if (whError || !rmWarehouse) {
-      throw new Error(`RM warehouse not found: ${whError?.message || 'No data'}`);
-    }
-
     const RM_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_RM_WAREHOUSE_ID, 10) || 18;
-    console.log(`🏭 RM Warehouse: MES ID ${rmWarehouse.id}, Sage WhseID ${RM_SAGE_WAREHOUSE_ID}`);
+    console.log(`🏭 Sage WhseID: ${RM_SAGE_WAREHOUSE_ID}`);
 
     let synced = 0;
     let errors = 0;
@@ -76,19 +65,15 @@ async function syncStockFromSage() {
 
         const sageQty = Number(result.recordset[0]?.QtyOnHand || 0);
 
-        // Update MES stock balance
-        const { error: upsertError } = await supabase
-          .from('warehouse_stock_balances')
-          .upsert({
-            raw_material_id: material.id,
-            warehouse_id: rmWarehouse.id,
-            quantity: sageQty,
-          }, {
-            onConflict: 'raw_material_id,warehouse_id'
-          });
+        // Update MES sage_stock_balances
+        const { error: rpcError } = await supabase.rpc('set_sage_stock_balance', {
+          p_sage_code: material.sage_code,
+          p_warehouse_id: RM_SAGE_WAREHOUSE_ID,
+          p_quantity: sageQty,
+        });
 
-        if (upsertError) {
-          console.error(`❌ ${material.code}: ${upsertError.message}`);
+        if (rpcError) {
+          console.error(`❌ ${material.code}: ${rpcError.message}`);
           errors++;
         } else {
           console.log(`✅ ${material.code} (${material.sage_code}): ${sageQty.toLocaleString()} ${material.unit}`);
