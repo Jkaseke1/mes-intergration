@@ -27,6 +27,7 @@ const sageConfig = {
 };
 
 const RM_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_RM_WAREHOUSE_ID, 10) || 18;
+const FG_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_WAREHOUSE_ID, 10) || 17;
 const SYNC_INTERVAL_MS = parseInt(process.env.STOCK_SYNC_INTERVAL_MINUTES, 10) * 60 * 1000 || 3600000; // Default 1 hour
 
 async function syncStockFromSage() {
@@ -35,6 +36,11 @@ async function syncStockFromSage() {
   try {
     const pool = await sql.connect(sageConfig);
 
+    let synced = 0;
+    let errors = 0;
+    let changed = 0;
+
+    // --- Raw Materials (WhseID 18) ---
     const { data: materials, error: matError } = await supabase
       .from('raw_materials')
       .select('id, name, code, sage_code, unit')
@@ -42,10 +48,6 @@ async function syncStockFromSage() {
       .not('sage_code', 'is', null);
 
     if (matError) throw matError;
-
-    let synced = 0;
-    let errors = 0;
-    let changed = 0;
 
     for (const material of materials) {
       try {
@@ -92,9 +94,62 @@ async function syncStockFromSage() {
       }
     }
 
+    // --- Finished Goods (WhseID 17) ---
+    const { data: formulations, error: formError } = await supabase
+      .from('formulations')
+      .select('id, name, sage_code')
+      .eq('status', 'active')
+      .not('sage_code', 'is', null);
+
+    if (formError) throw formError;
+
+    for (const form of formulations || []) {
+      try {
+        const result = await pool.request()
+          .input('Code', sql.VarChar, form.sage_code)
+          .input('WhseID', sql.VarChar, FG_SAGE_WAREHOUSE_ID.toString())
+          .query(`
+            SELECT TOP 1 QtyOnHand 
+            FROM _bvWarehouseStockFull 
+            WHERE Code = @Code 
+              AND WhseID = @WhseID
+          `);
+
+        const sageQty = Number(result.recordset[0]?.QtyOnHand || 0);
+
+        const { data: existing } = await supabase
+          .from('sage_stock_balances')
+          .select('quantity')
+          .eq('sage_code', form.sage_code)
+          .eq('warehouse_id', FG_SAGE_WAREHOUSE_ID)
+          .single();
+
+        const oldQty = Number(existing?.quantity || 0);
+        const qtyChanged = Math.abs(sageQty - oldQty) > 0.001;
+
+        const { error: rpcError } = await supabase.rpc('set_sage_stock_balance', {
+          p_sage_code: form.sage_code,
+          p_warehouse_id: FG_SAGE_WAREHOUSE_ID,
+          p_quantity: sageQty,
+        });
+
+        if (rpcError) {
+          errors++;
+        } else {
+          synced++;
+          if (qtyChanged) {
+            changed++;
+            console.log(`  📦 ${form.sage_code}: ${oldQty.toLocaleString()} → ${sageQty.toLocaleString()} kg`);
+          }
+        }
+      } catch (err) {
+        errors++;
+      }
+    }
+
     await pool.close();
 
-    console.log(`✅ Sync complete: ${synced} synced, ${changed} changed, ${errors} errors`);
+    console.log(`✅ Sync complete: ${synced} synced (${(materials?.length||0)} RM + ${(formulations?.length||0)} FG), ${changed} changed, ${errors} errors`);
 
   } catch (error) {
     console.error('❌ Stock sync failed:', error.message);
