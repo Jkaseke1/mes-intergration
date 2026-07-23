@@ -4,17 +4,23 @@
 const sql = require('mssql');
 
 // Transaction codes from TrCodes table (iModule = 11)
-// MFDR  = Manufacturing Draw (raw material issue to WIP, debit WIP, credit RM inventory)
-// MFMF  = Manufacturing Manufacture (FG/WIP receipt, debit FG/WIP inventory, credit WIP)
-// WHT   = Warehouse Transfer (dispatch/transfer, GL net zero)
-// GRV   = Goods Received Voucher (GRN, debit inventory, credit GRN accrual)
-// ADJ   = Adjustments (recon variances)
+// MFDR  = stock-OUT class (writes QtyOut). MFMF/GRV = stock-IN class (writes QtyIn).
+// PostInventoryTxV2 MUST pass ABS(qty) into _bspPostStTrans — Sage does
+//   QtyOnHand += QtyIn - QtyOut
+// so QtyOut=-N increases stock. Direction for GL is StockDebit/StockCredit; TrCode picks In vs Out field.
+// Prefer MFDR for outs and MFMF for ins. Keep WHT/ADJ out of the path until proven.
 const TX_CODE_GRN = process.env.SAGE_TX_CODE_GRN || 'GRV';
 const TX_CODE_ISSUE = process.env.SAGE_TX_CODE_ISSUE || 'MFDR';
 const TX_CODE_PRODUCTION = process.env.SAGE_TX_CODE_PRODUCTION || 'MFMF';
-const TX_CODE_DISPATCH = process.env.SAGE_TX_CODE_DISPATCH || 'WHT';
-const TX_CODE_RECON = process.env.SAGE_TX_CODE_RECON || 'ADJ';
+const TX_CODE_DISPATCH = process.env.SAGE_TX_CODE_DISPATCH || 'MFDR'; // source leg out
+const TX_CODE_DISPATCH_IN = process.env.SAGE_TX_CODE_DISPATCH_IN || 'MFMF'; // dest leg in
+const TX_CODE_RECON = process.env.SAGE_TX_CODE_RECON || 'MFDR';
 const TX_CODE_MACROPACK = process.env.SAGE_TX_CODE_MACROPACK || 'MFMF';
+const TX_CODE_TRANSFER_OUT = process.env.SAGE_TX_CODE_TRANSFER_OUT || process.env.SAGE_TX_CODE_TRANSFER || 'MFDR';
+const TX_CODE_TRANSFER_IN = process.env.SAGE_TX_CODE_TRANSFER_IN || 'MFMF';
+const TX_CODES_STOCK_OUT_SAFE = new Set(
+  (process.env.SAGE_TX_CODES_STOCK_OUT_SAFE || 'MFDR').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
+);
 
 // GL account codes (leave empty to use TrCodes default accounts; override only if needed)
 const GL_ACCOUNT_GRN = process.env.SAGE_GL_ACCOUNT_GRN || '';
@@ -81,7 +87,18 @@ async function postInventoryTransaction(pool, {
       glAccount = GL_ACCOUNT_WIP;
       break;
     case 'dispatch':
-      txCode = TX_CODE_DISPATCH;
+      // Dispatch source OUT or dest IN — pick code by qty sign
+      txCode = quantity < 0 ? TX_CODE_DISPATCH : TX_CODE_DISPATCH_IN;
+      glAccount = GL_ACCOUNT_COGS;
+      break;
+    case 'transfer_out':
+      // PD → DEB out leg. Must be MFDR-class (WHT/ADJ increase stock on negative qty).
+      txCode = TX_CODE_TRANSFER_OUT;
+      glAccount = GL_ACCOUNT_COGS;
+      break;
+    case 'transfer_in':
+      // DEB receipt leg
+      txCode = TX_CODE_TRANSFER_IN;
       glAccount = GL_ACCOUNT_COGS;
       break;
     case 'recon':
@@ -94,6 +111,15 @@ async function postInventoryTransaction(pool, {
       break;
     default:
       throw new Error(`Unknown transaction type: ${transactionType}`);
+  }
+
+  // Safety: stock-OUT must use an OUT-class TrCode (writes QtyOut). MFDR is proven.
+  // With AbsQuantity fix, QtyOut is positive so stock decreases; wrong TrCode still risks QtyIn.
+  if (quantity < 0 && !TX_CODES_STOCK_OUT_SAFE.has(String(txCode).toUpperCase())) {
+    throw new Error(
+      `Refusing stock-OUT with TrCode ${txCode} via PostInventoryTxV2: only [${[...TX_CODES_STOCK_OUT_SAFE].join(',')}] ` +
+      'are allowed for negative qty (OUT-class codes). Set SAGE_TX_CODE_*_OUT=MFDR.'
+    );
   }
 
   // Route GRN transactions through PostGRVV2 (with Trade Payables + cost revaluation)

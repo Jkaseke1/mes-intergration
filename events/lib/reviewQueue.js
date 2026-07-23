@@ -11,12 +11,15 @@ const supabase = createClient(
 );
 
 // Transaction code mapping (same as sagePost.js)
+// Stock-OUT must use MFDR-class codes. WHT and ADJ increase QtyOnHand on negative qty via PostInventoryTxV2.
 const TX_CODES = {
   grn: process.env.SAGE_TX_CODE_GRN || 'GRV',
   issue: process.env.SAGE_TX_CODE_ISSUE || 'MFDR',
   production: process.env.SAGE_TX_CODE_PRODUCTION || 'MFMF',
-  dispatch: process.env.SAGE_TX_CODE_DISPATCH || 'WHT',
-  recon: process.env.SAGE_TX_CODE_RECON || 'ADJ',
+  dispatch: process.env.SAGE_TX_CODE_DISPATCH || 'MFDR',
+  transfer_out: process.env.SAGE_TX_CODE_TRANSFER_OUT || process.env.SAGE_TX_CODE_TRANSFER || 'MFDR',
+  transfer_in: process.env.SAGE_TX_CODE_TRANSFER_IN || 'MFMF',
+  recon: process.env.SAGE_TX_CODE_RECON || 'MFDR',
   macropack: process.env.SAGE_TX_CODE_MACROPACK || 'MFMF',
 };
 

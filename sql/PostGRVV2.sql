@@ -1,4 +1,6 @@
 -- PostGRVV2 - GRV-specific posting with Trade Payables credit + cost revaluation
+-- Also creates a posted GRV document in InvNum + _btblInvoiceLines so QtyOnHand
+-- survives Sage stock rebuilds / relinks.
 -- Deployable version: drops existing SP then creates via sp_executesql to avoid GO batch separator issues
 
 USE [Hyperfeeds 2024 Live];
@@ -66,15 +68,27 @@ BEGIN
     declare @VarianceAmount float;
     declare @AbsVariance float;
 
+    -- GRV document variables (InvNum / _btblInvoiceLines)
+    declare @NewInvID bigint;
+    declare @NewLineID bigint;
+    declare @GrvDocNumber varchar(50);
+    declare @LineTotExcl float;
+    declare @IsWhseItem bit;
+    declare @UOMCategoryID int;
+    declare @AgentID int;
+
     -- Prefetch data
     SELECT @HarvestItemID = COALESCE((SELECT StockLink FROM StkItem WHERE Code = @ItemCode),0);
     SELECT @WarehouseID = COALESCE((SELECT WhseLink FROM Whsemst WHERE Code = @WHCode),0);
     SELECT @TransactionCodeID = COALESCE((SELECT idTrCodes FROM TrCodes WHERE iModule = 11 AND Code = @InventoryTransactionCode),0);
     SELECT @isLotItem = (SELECT bLotItem FROM StkItem WHERE StockLink = @HarvestItemID);
+    SELECT @IsWhseItem = COALESCE((SELECT WhseItem FROM StkItem WHERE StockLink = @HarvestItemID), 0);
+    -- StkItem has no iUOMCategoryID in this company DB; line default is 0
+    SELECT @UOMCategoryID = 0;
+    -- No Agents table in this company DB; leave agent unset
+    SELECT @AgentID = 0;
 
     -- Resolve Trade Payables (contra) account:
-    -- 1. If explicit TradePayablesAccountCode provided and exists, use it
-    -- 2. Fall back to TrCodes.Account2Link (GRN Accrual)
     DECLARE @PassedPayablesLink bigint;
     SELECT @PassedPayablesLink = NULLIF((SELECT AccountLink FROM Accounts WHERE Master_Sub_Account = @TradePayablesAccountCode), 0);
 
@@ -84,7 +98,6 @@ BEGIN
     END
     ELSE
     BEGIN
-        -- Fall back to TrCodes Account2Link (original GRN Accrual behavior)
         SELECT @ContraAccountLink = (SELECT Account2Link FROM TrCodes WHERE idTrCodes = @TransactionCodeID);
         IF @ContraAccountLink IS NULL OR @ContraAccountLink = 0
             SELECT @ContraAccountLink = COALESCE(
@@ -93,9 +106,7 @@ BEGIN
             );
     END
 
-    -- Resolve Variance account (Purchase Cost Variance):
-    -- 1. If explicit VarianceAccountCode provided and exists, use it
-    -- 2. Fall back to TrCodes.Account1Link (stock account — not ideal but safe)
+    -- Resolve Variance account (Purchase Cost Variance)
     DECLARE @PassedVarianceLink bigint;
     SELECT @PassedVarianceLink = NULLIF((SELECT AccountLink FROM Accounts WHERE Master_Sub_Account = @VarianceAccountCode), 0);
 
@@ -105,7 +116,6 @@ BEGIN
     END
     ELSE
     BEGIN
-        -- No variance account specified — skip variance posting
         SELECT @VarianceAccountLink = 0;
     END
 
@@ -119,7 +129,6 @@ BEGIN
 
     -- ========================================================================
     -- STEP 1: Capture old stock state for cost revaluation
-    -- Read from _etblStockQtys (quantities) and _etblStockCosts (costs)
     -- ========================================================================
     SELECT
         @OldTotalQty = COALESCE(SUM(QtyOnHand), 0)
@@ -127,13 +136,11 @@ BEGIN
     WHERE StockID = @HarvestItemID
       AND QtyOnHand > 0;
 
-    -- Get the item-level average cost (WhseID = 0 is the global/item-level cost)
     SELECT @OldWeightedAvg = COALESCE(
         (SELECT TOP 1 AverageCost FROM _etblStockCosts WHERE StockID = @HarvestItemID AND WhseID = 0),
         0
     );
 
-    -- If no existing stock, no variance to calculate
     IF @OldTotalQty > 0 AND @OldWeightedAvg > 0
         SELECT @OldTotalValue = @OldTotalQty * @OldWeightedAvg;
     ELSE
@@ -144,17 +151,16 @@ BEGIN
     END
 
     -- ========================================================================
-    -- STEP 2: Post stock receipt (same as PostInventoryTxV2)
+    -- STEP 2: Post stock receipt
     -- ========================================================================
     SELECT @AbsQuantity = ABS(@Quantity),
            @Amount = CASE WHEN @UnitCost > 0 THEN ABS(@Quantity) * @UnitCost ELSE 0 END,
            @Id = ''HYPER'',
-           @TxBranchID = 0;
+           @TxBranchID = 0,
+           @LineTotExcl = CASE WHEN @UnitCost > 0 THEN ABS(@Quantity) * @UnitCost ELSE 0 END;
 
-    -- Stock IN: debit stock, credit contra (Trade Payables)
     SELECT @StockDebit = @Amount, @StockCredit = 0, @ContraDebit = 0, @ContraCredit = @Amount;
 
-    -- Get Stock Account Link for Item from warehouse-specific stock group
     SELECT @StockInventoryAccountLink = COALESCE(
         (SELECT G.StockAccLink
          FROM _etblStockDetails SD
@@ -169,14 +175,11 @@ BEGIN
 
     SELECT @UOMID = iUOMStockingUnitID FROM StkItem WHERE StockLink = @HarvestItemID;
 
-    -- Get audit number
     EXEC @AuditTemp = _bspNextAuditNo;
     SELECT @AuditNo = CASE WHEN @IsBranch = 1 THEN Cast(@TxBranchID as varchar(20)) + ''.'' + CAST(@AuditTemp as varchar) + ''.0001'' ELSE CAST(@AuditTemp as varchar) + ''.0001'' END;
 
-    -- Get period
     SELECT @Period = (SELECT MAX(idPeriod) + 1 FROM _etblPeriod WHERE dPeriodDate < @TransactionDate);
 
-    -- Book Lot adjustment
     IF((@LotNumber != '''') AND (@isLotItem = 1))
     BEGIN
         EXECUTE @LotID = _espLTPostLots
@@ -202,7 +205,6 @@ BEGIN
         SELECT @LotID = 0
     END
 
-    -- Book stock adjustment (updates QtyOnHand + fAverageCost for receiving warehouse)
     EXECUTE @RC = _bspPostStTrans
         @AutoIdxStockTrans OUTPUT,
         @TransactionDate,
@@ -254,7 +256,6 @@ BEGIN
         0,
         0;
 
-    -- Book Trade Payables (contra) GL entry — Credit Trade Payables
     SELECT @AutoIdx = 0;
     EXECUTE @RC = _bspPostGLTrans
         @AutoIdx OUTPUT,
@@ -297,7 +298,6 @@ BEGIN
         0,
         '''';
 
-    -- Book Stock inventory GL entry — Debit Stock Account
     SELECT @AutoIdx = 0;
     EXECUTE @RC = _bspPostGLTrans
         @AutoIdx OUTPUT,
@@ -341,42 +341,164 @@ BEGIN
         '''';
 
     -- ========================================================================
+    -- STEP 2b: Create posted GRV document (InvNum + _btblInvoiceLines)
+    -- Document trail only — does NOT re-post stock (already done above).
+    -- ========================================================================
+    BEGIN TRY
+        SELECT @GrvDocNumber = CASE
+            WHEN NULLIF(LTRIM(RTRIM(@Reference)), '''') IS NOT NULL THEN LEFT(LTRIM(RTRIM(@Reference)), 50)
+            ELSE ''HFGRV'' + RIGHT(''000000'' + CAST(ABS(CHECKSUM(NEWID())) % 1000000 AS varchar(6)), 6)
+        END;
+
+        IF EXISTS (SELECT 1 FROM InvNum WHERE InvNumber = @GrvDocNumber AND DocType = 2)
+            SELECT @GrvDocNumber = LEFT(@GrvDocNumber, 40) + ''-'' + RIGHT(''000'' + CAST(ABS(CHECKSUM(NEWID())) % 1000 AS varchar(3)), 3);
+
+        INSERT INTO InvNum (
+            DocType, DocVersion, DocState, DocFlag, OrigDocID,
+            InvNumber, GrvNumber, GrvID, AccountID, Description,
+            InvDate, OrderDate, DueDate, DeliveryDate,
+            TaxInclusive, Email_Sent,
+            DelMethodID, DocRepID, OrderNum, DeliveryNote,
+            InvDisc, InvDiscReasonID,
+            Message1, Message2, Message3,
+            ProjectID, TillID, POSAmntTendered, POSChange,
+            GrvSplitFixedCost, GrvSplitFixedAmnt,
+            OrderStatusID, OrderPriorityID, ExtOrderNum, ForeignCurrencyID,
+            InvDiscAmnt, InvDiscAmntEx,
+            InvTotExclDEx, InvTotTaxDEx, InvTotInclDEx,
+            InvTotExcl, InvTotTax, InvTotIncl,
+            OrdDiscAmnt, OrdDiscAmntEx,
+            OrdTotExclDEx, OrdTotTaxDEx, OrdTotInclDEx,
+            OrdTotExcl, OrdTotTax, OrdTotIncl,
+            bUseFixedPrices, iDocPrinted, iINVNUMAgentID, fExchangeRate,
+            InvNum_dCreatedDate, InvNum_dModifiedDate
+        )
+        VALUES (
+            2, 1, 4, 0, 0,
+            @GrvDocNumber, @GrvDocNumber, 0, 0,
+            LEFT(COALESCE(@Description, @ItemCode), 50),
+            @TransactionDate, @TransactionDate, @TransactionDate, @TransactionDate,
+            0, 0,
+            0, 0, '''', '''',
+            0, 0,
+            '''', '''', '''',
+            COALESCE(@ProjectID, 0), 0, 0, 0,
+            0, 0,
+            0, 0, LEFT(COALESCE(@Reference2, ''''), 50), 0,
+            0, 0,
+            @LineTotExcl, 0, @LineTotExcl,
+            @LineTotExcl, 0, @LineTotExcl,
+            0, 0,
+            @LineTotExcl, 0, @LineTotExcl,
+            @LineTotExcl, 0, @LineTotExcl,
+            0, 0, @AgentID, 1,
+            GETDATE(), GETDATE()
+        );
+
+        SELECT @NewInvID = SCOPE_IDENTITY();
+
+        IF @NewInvID IS NOT NULL AND @NewInvID > 0
+        BEGIN
+            INSERT INTO _btblInvoiceLines (
+                iInvoiceID, iOrigLineID, iGrvLineID, iLineDocketMode,
+                cDescription,
+                iUnitsOfMeasureStockingID, iUnitsOfMeasureCategoryID, iUnitsOfMeasureID,
+                fQuantity, fQtyChange, fQtyToProcess, fQtyLastProcess, fQtyProcessed,
+                fQtyReserved, fQtyReservedChange,
+                cLineNotes,
+                fUnitPriceExcl, fUnitPriceIncl, iUnitPriceOverrideReasonID,
+                fUnitCost, fLineDiscount, iLineDiscountReasonID, iReturnReasonID,
+                fTaxRate, bIsSerialItem, bIsWhseItem, fAddCost, cTradeinItem,
+                iStockCodeID, iJobID, iWarehouseID, iTaxTypeID, iPriceListNameID,
+                fQuantityLineTotIncl, fQuantityLineTotExcl,
+                fQuantityLineTotInclNoDisc, fQuantityLineTotExclNoDisc,
+                fQuantityLineTaxAmount, fQuantityLineTaxAmountNoDisc,
+                fQtyChangeLineTotIncl, fQtyChangeLineTotExcl,
+                fQtyChangeLineTotInclNoDisc, fQtyChangeLineTotExclNoDisc,
+                fQtyChangeLineTaxAmount, fQtyChangeLineTaxAmountNoDisc,
+                fQtyToProcessLineTotIncl, fQtyToProcessLineTotExcl,
+                fQtyToProcessLineTotInclNoDisc, fQtyToProcessLineTotExclNoDisc,
+                fQtyToProcessLineTaxAmount, fQtyToProcessLineTaxAmountNoDisc,
+                fQtyLastProcessLineTotIncl, fQtyLastProcessLineTotExcl,
+                fQtyLastProcessLineTotInclNoDisc, fQtyLastProcessLineTotExclNoDisc,
+                fQtyLastProcessLineTaxAmount, fQtyLastProcessLineTaxAmountNoDisc,
+                fQtyProcessedLineTotIncl, fQtyProcessedLineTotExcl,
+                fQtyProcessedLineTotInclNoDisc, fQtyProcessedLineTotExclNoDisc,
+                fQtyProcessedLineTaxAmount, fQtyProcessedLineTaxAmountNoDisc,
+                iLineRepID, iLineProjectID, iLedgerAccountID, iModule,
+                bChargeCom, bIsLotItem, iMFPID, iLineID,
+                fQuantityUR, fQtyChangeUR, fQtyToProcessUR, fQtyLastProcessUR, fQtyProcessedUR,
+                _btblInvoiceLines_dCreatedDate, _btblInvoiceLines_dModifiedDate
+            )
+            VALUES (
+                @NewInvID, 0, 0, 0,
+                LEFT(COALESCE(@Description, @ItemCode), 100),
+                COALESCE(@UOMID, 0), COALESCE(@UOMCategoryID, 0), COALESCE(@UOMID, 0),
+                @AbsQuantity, 0, 0, 0, @AbsQuantity,
+                0, 0,
+                LEFT(COALESCE(@Reference2, ''''), 255),
+                @UnitCost, @UnitCost, 0,
+                @UnitCost, 0, 0, 0,
+                0, 0, @IsWhseItem, 0, '''',
+                @HarvestItemID, 0, @WarehouseID, 0, 0,
+                @LineTotExcl, @LineTotExcl,
+                @LineTotExcl, @LineTotExcl,
+                0, 0,
+                0, 0,
+                0, 0,
+                0, 0,
+                0, 0,
+                0, 0,
+                0, 0,
+                0, 0,
+                0, 0,
+                0, 0,
+                @LineTotExcl, @LineTotExcl,
+                @LineTotExcl, @LineTotExcl,
+                0, 0,
+                0, COALESCE(@ProjectID, 0), @StockInventoryAccountLink, 0,
+                0, COALESCE(@isLotItem, 0), 0, 1,
+                @AbsQuantity, 0, 0, 0, @AbsQuantity,
+                GETDATE(), GETDATE()
+            );
+
+            SELECT @NewLineID = SCOPE_IDENTITY();
+        END
+    END TRY
+    BEGIN CATCH
+        DECLARE @DocErr nvarchar(4000) = ERROR_MESSAGE();
+        RAISERROR(''PostGRVV2 warning: GRV document create failed (stock already posted): %s'', 10, 1, @DocErr);
+    END CATCH
+
+    -- ========================================================================
     -- STEP 3: Calculate and post cost revaluation
     -- ========================================================================
     IF @VarianceAccountLink > 0 AND @OldTotalQty > 0
     BEGIN
-        -- Calculate new weighted average cost
         SELECT
             @NewTotalQty = @OldTotalQty + @AbsQuantity,
             @NewTotalValue = @OldTotalValue + @Amount,
             @NewWeightedAvg = CASE WHEN @NewTotalQty > 0 THEN @NewTotalValue / @NewTotalQty ELSE @UnitCost END;
 
-        -- Variance = old stock revalued from old avg to new avg
-        -- Positive = stock value increased (new cost > old cost) → Debit Stock, Credit Variance
-        -- Negative = stock value decreased (new cost < old cost) → Debit Variance, Credit Stock
         SELECT @VarianceAmount = @OldTotalQty * (@NewWeightedAvg - @OldWeightedAvg);
         SELECT @AbsVariance = ABS(@VarianceAmount);
 
-        IF @AbsVariance > 0.01  -- Only post if variance is material
+        IF @AbsVariance > 0.01
         BEGIN
-            -- Get a new audit number for variance entries
             EXEC @AuditTemp = _bspNextAuditNo;
             SELECT @AuditNo = CAST(@AuditTemp as varchar) + ''.0001'';
 
             IF @VarianceAmount > 0
             BEGIN
-                -- Stock value increased: Debit Stock, Credit Variance
                 SELECT @VarianceDebit = 0, @VarianceCredit = @AbsVariance;
                 SELECT @StockDebit = @AbsVariance, @StockCredit = 0;
             END
             ELSE
             BEGIN
-                -- Stock value decreased: Debit Variance, Credit Stock
                 SELECT @VarianceDebit = @AbsVariance, @VarianceCredit = 0;
                 SELECT @StockDebit = 0, @StockCredit = @AbsVariance;
             END
 
-            -- Post Variance GL entry (Purchase Cost Variance)
             DECLARE @VarianceDesc varchar(255);
             SET @VarianceDesc = @Description + '' (Cost Revaluation)'';
             SELECT @AutoIdx = 0;
@@ -405,7 +527,6 @@ BEGIN
                 0, 0, 0, 0, 0,
                 '''', 0, 0, '''';
 
-            -- Post Stock adjustment GL entry (revaluation of existing stock)
             SELECT @AutoIdx = 0;
             EXECUTE @RC = _bspPostGLTrans
                 @AutoIdx OUTPUT,
@@ -431,24 +552,17 @@ BEGIN
                 @TxBranchID,
                 0, 0, 0, 0, 0,
                 '''', 0, 0, '''';
-
-            -- Note: _bspPostStTrans already updates _etblStockCosts.AverageCost internally
-            -- We only need to post the GL variance entries (above)
-            -- Do NOT update _etblStockCosts ourselves — _bspPostStTrans handles it
         END
     END
 
     -- ========================================================================
     -- STEP 4: Update LastGRVCost for global and receiving warehouse
-    -- _bspPostStTrans updates AverageCost but does not update LastGRVCost,
-    -- so we set it explicitly for the GRN receipt cost.
     -- ========================================================================
     UPDATE _etblStockCosts
     SET LastGRVCost = @UnitCost
     WHERE StockID = @HarvestItemID
       AND WhseID IN (0, @WarehouseID);
 
-    -- If the receiving warehouse does not have a cost row yet, create it
     IF @@ROWCOUNT = 0 OR NOT EXISTS (
         SELECT 1 FROM _etblStockCosts
         WHERE StockID = @HarvestItemID AND WhseID = @WarehouseID
@@ -465,5 +579,6 @@ BEGIN
     RETURN 0;
 END;
 ';
+
 
 EXEC sp_executesql @sql;

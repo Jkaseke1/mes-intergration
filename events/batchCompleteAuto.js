@@ -100,12 +100,23 @@ async function handleBatchComplete(syncEvent) {
 
     if (stockResult.recordset.length === 0) throw new Error(`${sageCode} not found in Sage`);
 
-    // Fetch live AverageCost from Sage for FG (pre-MES logic: MFMF uses moving average cost)
+    // Fetch live AverageCost from Sage for FG when available
     const fgCostResult = await pool.request()
       .input('Code', sql.VarChar, sageCode)
       .query(`SELECT TOP 1 AverageCost FROM _bvWarehouseStockFull WHERE Code = @Code`);
-    fgAvgCost = fgCostResult.recordset[0]?.AverageCost || 0;
-    console.log(`  Sage FG AverageCost: ${sageCode} = $${fgAvgCost.toFixed(4)}/kg (using this for MFMF + transfer)`);
+    fgAvgCost = Number(fgCostResult.recordset[0]?.AverageCost || 0);
+
+    // First-time / zero-cost FG: post at calculated RM cost so stock value is not $0
+    const postingUnitCost = fgAvgCost > 0 ? fgAvgCost : costPerUnit;
+    if (fgAvgCost > 0) {
+      console.log(`  Sage FG AverageCost: ${sageCode} = $${fgAvgCost.toFixed(4)}/kg (using this for MFMF + transfer)`);
+    } else {
+      console.log(`  Sage FG AverageCost: ${sageCode} = $0.0000/kg — using calculated RM cost $${costPerUnit.toFixed(4)}/kg for MFMF + transfer`);
+    }
+
+    if (!(postingUnitCost > 0)) {
+      throw new Error(`Cannot post production complete for ${sageCode}: FG AverageCost is 0 and RM cost_per_unit is 0`);
+    }
 
     const reference   = `WO-${order.batch_number}`.substring(0, 20);
     const description = `${order.formulations?.name} complete`.substring(0, 40);
@@ -118,37 +129,39 @@ async function handleBatchComplete(syncEvent) {
       transactionType: 'production',
       quantity: netQty,
       whseId: FG_WAREHOUSE_ID,
-      unitCost: fgAvgCost,
+      unitCost: postingUnitCost,
       reference,
       description,
       transactionDate: new Date(),
     });
 
     if (doTransfer) {
-      // 2. PD issue (WHT out) — save for review
+      // 2. PD out — use transfer_out (ADJ by default). Never WHT via PostInventoryTxV2
+      //    (WHT ignores negative qty and increases PD stock).
       await saveForReview(syncEvent.id, 'production_completed', `Transfer PD→DEB ${sageCode}`, {
         sageCode,
-        transactionType: 'dispatch',
+        transactionType: 'transfer_out',
         quantity: -netQty,
         whseId: FG_WAREHOUSE_ID,
-        unitCost: fgAvgCost,
+        unitCost: postingUnitCost,
         reference,
         description: 'Transfer to DEB',
         transactionDate: new Date(),
       });
 
-      // 3. DEB receipt (WHT in) — save for review
+      // 3. DEB in
       await saveForReview(syncEvent.id, 'production_completed', `Transfer DEB receipt ${sageCode}`, {
         sageCode,
-        transactionType: 'dispatch',
+        transactionType: 'transfer_in',
         quantity: netQty,
         whseId: FG_TRANSFER_WAREHOUSE_ID,
-        unitCost: fgAvgCost,
+        unitCost: postingUnitCost,
         reference,
         description: 'Transfer from PD',
         transactionDate: new Date(),
       });
     }
+
 
   } finally {
     if (pool) await sql.close();
@@ -167,7 +180,7 @@ async function handleBatchComplete(syncEvent) {
     if (costUpdateError) {
       console.warn(`  cost_per_unit write to Supabase failed: ${costUpdateError.message}`);
     } else {
-      console.log(`  RM cost_per_unit saved to Supabase (reporting only): $${costPerUnit.toFixed(4)}/kg | Sage AverageCost: $${fgAvgCost ? fgAvgCost.toFixed(4) : 'N/A'}/kg`);
+      console.log(`  RM cost_per_unit saved to Supabase (reporting only): $${costPerUnit.toFixed(4)}/kg | Posting unit cost: $${(fgAvgCost > 0 ? fgAvgCost : costPerUnit).toFixed(4)}/kg`);
     }
   }
 }

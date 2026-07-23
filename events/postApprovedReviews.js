@@ -7,6 +7,7 @@ const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
 const { postInventoryTransaction, getWarehouseCode } = require('./lib/sagePost');
 const { checkAllReviewsFinalized } = require('./lib/reviewQueue');
+const { syncAfterPosting } = require('./lib/syncStock');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 
@@ -106,6 +107,12 @@ async function postApprovedReviews() {
           })
           .eq('id', review.id);
       }
+    }
+
+    // Batch sync all materials that were posted
+    const postedSageCodes = [...new Set(approved.map(r => r.sage_code))];
+    if (postedSageCodes.length > 0 && !DRY_RUN) {
+      await syncAfterPosting(pool, supabase, postedSageCodes, 'Finance Posting');
     }
 
     // Check if all reviews for each event are finalized, then mark sync_log as success
