@@ -22,7 +22,8 @@ DECLARE @sql NVARCHAR(MAX) = N'CREATE PROCEDURE [dbo].[PostGRVV2]
     @Reference2 varchar(50)='''',
     @TransactionDate datetime,
     @Description varchar(255),
-    @UserName varchar(50)
+    @UserName varchar(50),
+    @SupplierCode varchar(50)
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -76,6 +77,7 @@ BEGIN
     declare @IsWhseItem bit;
     declare @UOMCategoryID int;
     declare @AgentID int;
+    declare @SupplierID int = 0;
 
     -- Prefetch data
     SELECT @HarvestItemID = COALESCE((SELECT StockLink FROM StkItem WHERE Code = @ItemCode),0);
@@ -87,6 +89,15 @@ BEGIN
     SELECT @UOMCategoryID = 0;
     -- No Agents table in this company DB; leave agent unset
     SELECT @AgentID = 0;
+
+    -- Resolve supplier (creditor) link for the GRV document
+    IF LEN(LTRIM(RTRIM(@SupplierCode))) > 0
+    BEGIN
+        SELECT @SupplierID = COALESCE(
+            (SELECT DCLink FROM Vendor WHERE Account = LTRIM(RTRIM(@SupplierCode))),
+            0
+        );
+    END
 
     -- Resolve Trade Payables (contra) account:
     DECLARE @PassedPayablesLink bigint;
@@ -375,7 +386,7 @@ BEGIN
         )
         VALUES (
             2, 1, 4, 0, 0,
-            @GrvDocNumber, @GrvDocNumber, 0, 0,
+            @GrvDocNumber, @GrvDocNumber, 0, COALESCE(@SupplierID, 0),
             LEFT(COALESCE(@Description, @ItemCode), 50),
             @TransactionDate, @TransactionDate, @TransactionDate, @TransactionDate,
             0, 0,

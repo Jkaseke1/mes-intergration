@@ -63,6 +63,7 @@ async function postInventoryTransaction(pool, {
   unitCost,
   reference,
   reference2 = '',
+  supplierCode = '',
   description,
   transactionDate,
   lotNumber = '',
@@ -127,6 +128,7 @@ async function postInventoryTransaction(pool, {
     return await postGRVTransaction(pool, {
       sageCode, txCode, quantity, whCode, lotNumber,
       unitCost, projectId, reference, reference2,
+      supplierCode,
       description, transactionDate,
     });
   }
@@ -155,6 +157,7 @@ async function postInventoryTransaction(pool, {
 async function postGRVTransaction(pool, {
   sageCode, txCode, quantity, whCode, lotNumber,
   unitCost, projectId, reference, reference2,
+  supplierCode,
   description, transactionDate,
 }) {
   const result = await pool.request()
@@ -172,6 +175,7 @@ async function postGRVTransaction(pool, {
     .input('TransactionDate', sql.DateTime, transactionDate || new Date())
     .input('Description', sql.VarChar, (description || '').substring(0, 255))
     .input('UserName', sql.VarChar, USERNAME)
+    .input('SupplierCode', sql.VarChar, supplierCode || '')
     .execute('PostGRVV2');
 
   return result;

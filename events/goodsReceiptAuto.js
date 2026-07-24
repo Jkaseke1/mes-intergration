@@ -110,6 +110,7 @@ async function handleGoodsReceipt(syncEvent) {
         whseId: 18,
         unitCost: cost,
         reference,
+        reference2: supplier?.sage_code || '',
         description,
         transactionDate: new Date(grn.received_date),
       });

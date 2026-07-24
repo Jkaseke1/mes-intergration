@@ -108,7 +108,8 @@ async function postApprovedReviews() {
               whseId: review.warehouse_id,
               unitCost: review.unit_cost,
               reference: review.reference,
-              reference2: review.reference2,
+              reference2: review.transaction_type === 'grn' ? '' : review.reference2,
+              supplierCode: review.transaction_type === 'grn' ? (review.reference2 || '') : '',
               description: review.description,
               transactionDate: new Date(review.transaction_date),
             });
