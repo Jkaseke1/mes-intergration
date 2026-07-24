@@ -75,6 +75,17 @@ async function handleGoodsReceipt(syncEvent) {
   try {
     pool = await sql.connect(sageConfig);
 
+    // Resolve supplier account from Sage Vendor table if not already in MES
+    let supplierAccount = supplier?.sage_code ? supplier.sage_code.trim() : '';
+    if (supplier?.name && !supplierAccount) {
+      const vendor = await pool.request()
+        .input('Name', sql.VarChar, supplier.name)
+        .query('SELECT TOP 1 Account FROM Vendor WHERE LTRIM(RTRIM(Name)) = LTRIM(RTRIM(@Name))');
+      if (vendor.recordset && vendor.recordset.length > 0) {
+        supplierAccount = vendor.recordset[0].Account;
+      }
+    }
+
     for (const item of items) {
       const sageCode = item.raw_materials?.sage_code;
       const rmName   = item.raw_materials?.name;
@@ -110,7 +121,7 @@ async function handleGoodsReceipt(syncEvent) {
         whseId: 18,
         unitCost: cost,
         reference,
-        reference2: supplier?.sage_code || '',
+        reference2: supplierAccount || '',
         description,
         transactionDate: new Date(grn.received_date),
       });
