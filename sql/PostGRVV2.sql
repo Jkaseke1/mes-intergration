@@ -385,7 +385,7 @@ BEGIN
             InvNum_dCreatedDate, InvNum_dModifiedDate
         )
         VALUES (
-            2, 1, 4, 0, 0,
+            2, 1, 4, 2, 0,
             @GrvDocNumber, @GrvDocNumber, 0, COALESCE(@SupplierID, 0),
             LEFT(COALESCE(@Description, @ItemCode), 50),
             @TransactionDate, @TransactionDate, @TransactionDate, @TransactionDate,
@@ -408,8 +408,11 @@ BEGIN
 
         SELECT @NewInvID = SCOPE_IDENTITY();
 
+        -- Set GrvID to own AutoIndex (matches existing Sage GRV pattern)
         IF @NewInvID IS NOT NULL AND @NewInvID > 0
         BEGIN
+            UPDATE InvNum SET GrvID = @NewInvID WHERE AutoIndex = @NewInvID;
+
             INSERT INTO _btblInvoiceLines (
                 iInvoiceID, iOrigLineID, iGrvLineID, iLineDocketMode,
                 cDescription,
