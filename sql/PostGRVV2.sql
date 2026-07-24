@@ -87,8 +87,6 @@ BEGIN
     SELECT @IsWhseItem = COALESCE((SELECT WhseItem FROM StkItem WHERE StockLink = @HarvestItemID), 0);
     -- StkItem has no iUOMCategoryID in this company DB; line default is 0
     SELECT @UOMCategoryID = 0;
-    -- No Agents table in this company DB; leave agent unset
-    SELECT @AgentID = 0;
 
     -- Resolve supplier (creditor) link for the GRV document
     IF LEN(LTRIM(RTRIM(@SupplierCode))) > 0
@@ -98,6 +96,12 @@ BEGIN
             0
         );
     END
+
+    -- Resolve supplier agent for the GRV document header
+    SELECT @AgentID = COALESCE(
+        (SELECT iAgentID FROM Vendor WHERE DCLink = @SupplierID),
+        0
+    );
 
     -- Resolve Trade Payables (contra) account:
     DECLARE @PassedPayablesLink bigint;
@@ -458,7 +462,7 @@ BEGIN
                 @UnitCost, @UnitCost, 0,
                 @UnitCost, 0, 0, 0,
                 0, 0, @IsWhseItem, 0, '''',
-                @HarvestItemID, 0, @WarehouseID, 0, 0,
+                @HarvestItemID, 0, @WarehouseID, 3, 0,
                 @LineTotExcl, @LineTotExcl,
                 @LineTotExcl, @LineTotExcl,
                 0, 0,
@@ -474,7 +478,7 @@ BEGIN
                 @LineTotExcl, @LineTotExcl,
                 @LineTotExcl, @LineTotExcl,
                 0, 0,
-                0, COALESCE(@ProjectID, 0), @StockInventoryAccountLink, 0,
+                0, COALESCE(@ProjectID, 0), 0, 0,
                 0, COALESCE(@isLotItem, 0), 0, 1,
                 @AbsQuantity, 0, 0, 0, @AbsQuantity,
                 GETDATE(), GETDATE()
