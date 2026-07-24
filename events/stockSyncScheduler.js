@@ -28,12 +28,34 @@ const sageConfig = {
     encrypt: false,
     trustServerCertificate: true,
     enableArithAbort: true,
+    requestTimeout: 120000,
+    connectTimeout: 30000,
   },
 };
 
 const RM_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_RM_WAREHOUSE_ID, 10) || 18;
 const FG_SAGE_WAREHOUSE_ID = parseInt(process.env.SAGE_FG_WAREHOUSE_ID, 10) || 17;
 const SYNC_INTERVAL_MS = parseInt(process.env.STOCK_SYNC_INTERVAL_MINUTES, 10) * 60 * 1000 || 300000; // Default 5 minutes
+
+function isRetryable(err) {
+  return err && /timeout|etimeout|econnreset|socket|network|abort/i.test(err.message || '');
+}
+
+async function withRetry(fn, attempts = 3, baseDelay = 1000) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryable(err) || i === attempts - 1) throw err;
+      const wait = baseDelay * Math.pow(2, i);
+      console.warn(`  ⚠️ Retry ${i + 1}/${attempts} for sync step in ${wait}ms (${err.message})`);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
+  throw lastErr;
+}
 
 let isSyncing = false;
 
@@ -91,34 +113,40 @@ async function syncStockFromSage() {
 
     for (const material of materials) {
       try {
-        const result = await pool.request()
-          .input('Code', sql.VarChar, material.sage_code)
-          .input('WhseID', sql.VarChar, RM_SAGE_WAREHOUSE_ID.toString())
-          .query(`
-            SELECT TOP 1 QtyOnHand 
-            FROM _bvWarehouseStockFull 
-            WHERE Code = @Code 
-              AND WhseID = @WhseID
-          `);
+        const result = await withRetry(async () =>
+          pool.request()
+            .input('Code', sql.VarChar, material.sage_code)
+            .input('WhseID', sql.VarChar, RM_SAGE_WAREHOUSE_ID.toString())
+            .query(`
+              SELECT TOP 1 QtyOnHand 
+              FROM _bvWarehouseStockFull 
+              WHERE Code = @Code 
+                AND WhseID = @WhseID
+            `)
+        );
 
         const sageQty = Number(result.recordset[0]?.QtyOnHand || 0);
 
         // Check if quantity changed
-        const { data: existing } = await supabase
-          .from('sage_stock_balances')
-          .select('quantity')
-          .eq('sage_code', material.sage_code)
-          .eq('warehouse_id', RM_SAGE_WAREHOUSE_ID)
-          .single();
+        const { data: existing } = await withRetry(async () =>
+          supabase
+            .from('sage_stock_balances')
+            .select('quantity')
+            .eq('sage_code', material.sage_code)
+            .eq('warehouse_id', RM_SAGE_WAREHOUSE_ID)
+            .single()
+        );
 
         const oldQty = Number(existing?.quantity || 0);
         const qtyChanged = Math.abs(sageQty - oldQty) > 0.001;
 
-        const { error: rpcError } = await supabase.rpc('set_sage_stock_balance', {
-          p_sage_code: material.sage_code,
-          p_warehouse_id: RM_SAGE_WAREHOUSE_ID,
-          p_quantity: sageQty,
-        });
+        const { error: rpcError } = await withRetry(async () =>
+          supabase.rpc('set_sage_stock_balance', {
+            p_sage_code: material.sage_code,
+            p_warehouse_id: RM_SAGE_WAREHOUSE_ID,
+            p_quantity: sageQty,
+          })
+        );
 
         if (rpcError) {
           errors++;
@@ -146,33 +174,39 @@ async function syncStockFromSage() {
 
     for (const form of formulations || []) {
       try {
-        const result = await pool.request()
-          .input('Code', sql.VarChar, form.sage_code)
-          .input('WhseID', sql.VarChar, FG_SAGE_WAREHOUSE_ID.toString())
-          .query(`
-            SELECT TOP 1 QtyOnHand 
-            FROM _bvWarehouseStockFull 
-            WHERE Code = @Code 
-              AND WhseID = @WhseID
-          `);
+        const result = await withRetry(async () =>
+          pool.request()
+            .input('Code', sql.VarChar, form.sage_code)
+            .input('WhseID', sql.VarChar, FG_SAGE_WAREHOUSE_ID.toString())
+            .query(`
+              SELECT TOP 1 QtyOnHand 
+              FROM _bvWarehouseStockFull 
+              WHERE Code = @Code 
+                AND WhseID = @WhseID
+            `)
+        );
 
         const sageQty = Number(result.recordset[0]?.QtyOnHand || 0);
 
-        const { data: existing } = await supabase
-          .from('sage_stock_balances')
-          .select('quantity')
-          .eq('sage_code', form.sage_code)
-          .eq('warehouse_id', FG_SAGE_WAREHOUSE_ID)
-          .single();
+        const { data: existing } = await withRetry(async () =>
+          supabase
+            .from('sage_stock_balances')
+            .select('quantity')
+            .eq('sage_code', form.sage_code)
+            .eq('warehouse_id', FG_SAGE_WAREHOUSE_ID)
+            .single()
+        );
 
         const oldQty = Number(existing?.quantity || 0);
         const qtyChanged = Math.abs(sageQty - oldQty) > 0.001;
 
-        const { error: rpcError } = await supabase.rpc('set_sage_stock_balance', {
-          p_sage_code: form.sage_code,
-          p_warehouse_id: FG_SAGE_WAREHOUSE_ID,
-          p_quantity: sageQty,
-        });
+        const { error: rpcError } = await withRetry(async () =>
+          supabase.rpc('set_sage_stock_balance', {
+            p_sage_code: form.sage_code,
+            p_warehouse_id: FG_SAGE_WAREHOUSE_ID,
+            p_quantity: sageQty,
+          })
+        );
 
         if (rpcError) {
           errors++;
