@@ -205,17 +205,20 @@ async function isAlreadyPosted(pool, review) {
       .input('TrCode', sql.VarChar, review.sage_tx_code)
       .input('WarehouseCode', sql.VarChar, whCode)
       .input('Reference', sql.VarChar, review.reference)
+      .input('SageCode', sql.VarChar, review.sage_code)
       .input('Qty', sql.Float, absQty)
       .query(`
-        SELECT TOP 1 AutoIdx
-        FROM _bvSTTransactionsFull
-        WHERE TrCode = @TrCode
-          AND WarehouseCode = @WarehouseCode
-          AND Reference = @Reference
+        SELECT TOP 1 t.AutoIdx
+        FROM _bvSTTransactionsFull t
+        JOIN StkItem s ON s.StockLink = t.AccountLink
+        WHERE LTRIM(RTRIM(t.TrCode)) = LTRIM(RTRIM(@TrCode))
+          AND LTRIM(RTRIM(t.WarehouseCode)) = LTRIM(RTRIM(@WarehouseCode))
+          AND t.Reference = @Reference
+          AND s.Code = @SageCode
           AND (
-            (QtyIn IS NOT NULL AND ABS(QtyIn - @Qty) < 0.001)
+            (t.QtyIn IS NOT NULL AND ABS(t.QtyIn - @Qty) < 0.001)
             OR
-            (QtyOut IS NOT NULL AND ABS(QtyOut - @Qty) < 0.001)
+            (t.QtyOut IS NOT NULL AND ABS(t.QtyOut - @Qty) < 0.001)
           )
       `);
 
