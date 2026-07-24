@@ -382,6 +382,7 @@ BEGIN
             OrdTotExclDEx, OrdTotTaxDEx, OrdTotInclDEx,
             OrdTotExcl, OrdTotTax, OrdTotIncl,
             bUseFixedPrices, iDocPrinted, iINVNUMAgentID, fExchangeRate,
+            bInvRounding, cAccountName,
             InvNum_dCreatedDate, InvNum_dModifiedDate
         )
         VALUES (
@@ -389,7 +390,7 @@ BEGIN
             @GrvDocNumber, @GrvDocNumber, 0, COALESCE(@SupplierID, 0),
             LEFT(COALESCE(@Description, @ItemCode), 50),
             @TransactionDate, @TransactionDate, @TransactionDate, @TransactionDate,
-            0, 0,
+            1, 1,
             0, 0, '''', '''',
             0, 0,
             '''', '''', '''',
@@ -403,6 +404,7 @@ BEGIN
             @LineTotExcl, 0, @LineTotExcl,
             @LineTotExcl, 0, @LineTotExcl,
             0, 0, @AgentID, 1,
+            1, NULL,
             GETDATE(), GETDATE()
         );
 
@@ -411,7 +413,9 @@ BEGIN
         -- Set GrvID to own AutoIndex (matches existing Sage GRV pattern)
         IF @NewInvID IS NOT NULL AND @NewInvID > 0
         BEGIN
-            UPDATE InvNum SET GrvID = @NewInvID WHERE AutoIndex = @NewInvID;
+            UPDATE InvNum SET GrvID = @NewInvID,
+                cAccountName = (SELECT Name FROM Vendor WHERE DCLink = COALESCE(@SupplierID, 0))
+            WHERE AutoIndex = @NewInvID;
 
             INSERT INTO _btblInvoiceLines (
                 iInvoiceID, iOrigLineID, iGrvLineID, iLineDocketMode,
