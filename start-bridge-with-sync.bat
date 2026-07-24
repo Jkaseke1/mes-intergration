@@ -2,19 +2,13 @@
 echo Starting MES Bridge Worker with Stock Sync...
 echo.
 
-REM Start stock sync scheduler in background
-start "Stock Sync Scheduler" cmd /k "cd /d %~dp0events && node stockSyncScheduler.js"
-
-REM Wait 2 seconds
-timeout /t 2 /nobreak >nul
-
-REM Start bridge worker
+REM Start bridge worker (it forks the stock sync scheduler automatically)
 start "Bridge Worker" cmd /k "cd /d %~dp0events && node bridgeworker.js"
 
 echo.
-echo ✅ Both services started!
-echo    - Stock Sync Scheduler (syncs every 5 minutes)
+echo ✅ Bridge Worker started!
 echo    - Bridge Worker (processes events every 30 seconds)
+echo    - Stock Sync Scheduler is started automatically by the bridge worker
 echo.
-echo Close the command windows to stop the services.
+echo Close the command window to stop both services.
 pause

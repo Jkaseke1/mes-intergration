@@ -4,8 +4,8 @@
  * Run this alongside the bridge worker
  */
 
-require('dotenv').config();
 const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const fs = require('fs');
 const sql = require('mssql');
 const { createClient } = require('@supabase/supabase-js');
