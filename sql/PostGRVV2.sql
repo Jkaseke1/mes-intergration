@@ -386,9 +386,9 @@ BEGIN
             InvNum_dCreatedDate, InvNum_dModifiedDate
         )
         VALUES (
-            2, 1, 4, 2, 0,
+            2, 1, 4, 1, 0,
             @GrvDocNumber, @GrvDocNumber, 0, COALESCE(@SupplierID, 0),
-            LEFT(COALESCE(@Description, @ItemCode), 50),
+            ''Goods Received Voucher'',
             @TransactionDate, @TransactionDate, @TransactionDate, @TransactionDate,
             1, 1,
             0, 0, '''', '''',
